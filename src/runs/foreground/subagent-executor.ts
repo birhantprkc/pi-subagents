@@ -59,7 +59,7 @@ import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
-import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -84,11 +84,8 @@ import { deliverInterruptRequest, readRevivalBriefs, requestAsyncSteer, type Ste
 import { updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
 import { canQueueRetainedAsyncFollowUp, steerAsyncRun } from "./async-steering-action.ts";
 import {
-	removeWorkflowForegroundSteeringRoute,
 	resolveWorkflowForegroundSteeringTarget,
 	steerWorkflowForegroundTarget,
-	workflowForegroundSteeringDir,
-	workflowForegroundSteeringLaunchOptions,
 } from "./workflow-foreground-steering.ts";
 import { stopAsyncRun } from "./async-stop-action.ts";
 import { dismissRecoveredWorkflow } from "./async-dismiss-action.ts";
@@ -96,7 +93,8 @@ import { promotePausedWorkflowIfSettled, reconcileDetachedWorkflowChildCompletio
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { resolveAsyncRootResultPath, waitForImportedAsyncRoot } from "../background/chain-root-attachment.ts";
 import { resultFilePath, writeAsyncResultFile } from "../background/result-files.ts";
-import { attachRootChildrenToSteps, createNestedRoute, findNestedControlResult, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, snapshotNestedEventFiles, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, createNestedRoute, findNestedControlResult, inheritedNestedParentAddressOf, inheritedNestedRouteOf, resolveNestedAsyncDir, snapshotNestedEventFiles, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedParentAddress, type NestedRoute, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import type { ChildRuntimeConfig } from "../shared/child-runtime-config.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild } from "../shared/child-identity.ts";
@@ -153,6 +151,9 @@ import {
 	type Details,
 	type ExtensionConfig,
 	type ForegroundResumeChild,
+	type ForegroundChildSessionControls,
+	type ForegroundSteerInput,
+	type ForegroundSteerOutcome,
 	type ForegroundRunControl,
 	type HostStepNodeV1,
 	type IntercomBridgeConfig,
@@ -436,6 +437,20 @@ interface ExecutorDeps {
 	activateSupervisorTransport?: () => void;
 	refreshResultDelivery?: () => void;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
+	/** Set when this executor runs inside a child session; carries the runtime settings the host passes instead of environment variables. */
+	childRuntime?: ChildRuntimeConfig;
+}
+
+function inheritedNestedRoute(deps: Pick<ExecutorDeps, "childRuntime">): NestedRoute | undefined {
+	return inheritedNestedRouteOf(deps.childRuntime);
+}
+
+function inheritedNestedParentAddress(deps: Pick<ExecutorDeps, "childRuntime">): NestedParentAddress | undefined {
+	return inheritedNestedParentAddressOf(deps.childRuntime);
+}
+
+function inheritedRunFanoutBudget(deps: Pick<ExecutorDeps, "childRuntime">): RunFanoutBudgetDescriptor | undefined {
+	return deps.childRuntime?.runFanoutBudget;
 }
 
 type ForkSessionFileForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => string | undefined;
@@ -512,7 +527,6 @@ function loadWorkflowScriptPath(params: SubagentParamsLike, runtimeCwd: string):
 function removeForegroundControlIfIdle(state: SubagentState, runId: string): boolean {
 	const control = state.foregroundControls.get(runId);
 	if (control && (!foregroundSchedulingSettled(control) || (control.activeChildren?.size ?? 0) > 0)) return false;
-	if (control) removeWorkflowForegroundSteeringRoute(control);
 	state.foregroundControls.delete(runId);
 	if (state.lastForegroundControlId === runId) state.lastForegroundControlId = null;
 	return true;
@@ -565,8 +579,8 @@ function formatForegroundActivity(control: SubagentState["foregroundControls"] e
 
 function nestedResolutionScopeForExecutor(deps: ExecutorDeps): NestedRunResolutionScope | undefined {
 	if (deps.allowMutatingManagementActions !== false) return undefined;
-	const route = resolveInheritedNestedRouteFromEnv();
-	const address = route ? resolveNestedParentAddressFromEnv() : undefined;
+	const route = inheritedNestedRoute(deps);
+	const address = route ? inheritedNestedParentAddress(deps) : undefined;
 	return {
 		routes: route ? [route] : [],
 		...(address ? { descendantOf: { parentRunId: address.parentRunId, ...(address.parentStepIndex !== undefined ? { parentStepIndex: address.parentStepIndex } : {}) } } : {}),
@@ -1299,6 +1313,7 @@ function appendStepToAsyncChain(input: {
 		modelScope: discoveredForAppend.modelScope,
 		interactive: input.ctx.hasUI,
 		permissions: input.deps.config.permissions,
+		childRuntime: input.deps.childRuntime,
 	});
 	const built = buildAsyncRunnerSteps(resolved.id, compactOptional<Parameters<typeof buildAsyncRunnerSteps>[1]>({
 		chain: wrapChainTasksForFork(chain, contextPolicy),
@@ -1311,7 +1326,7 @@ function appendStepToAsyncChain(input: {
 		cwd: status.cwd ?? input.requestCwd,
 		chainSkills,
 		dynamicFanoutMaxItems: input.deps.config.chain?.dynamicFanout?.maxItems,
-		maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth),
+		maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 		waitToolEnabled: input.deps.waitToolEnabled,
 		waitToolDefaultTimeoutMs: input.deps.waitToolDefaultTimeoutMs,
 		contextForAgent: contextPolicy.contextForAgent,
@@ -1637,11 +1652,11 @@ async function resumeExternalJobFollowUp(input: {
 		return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId, asyncDir, duplicate: true, interactive: input.ctx.hasUI });
 	}
 
-	const depthState = checkSubagentDepth(input.deps.config.maxSubagentDepth);
+	const depthState = checkSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime);
 	if (depthState.blocked) {
 		return { content: [{ type: "text", text: `Nested subagent resume blocked (depth=${depthState.depth}, max=${depthState.maxDepth}). Complete the follow-up directly instead.` }], isError: true, details: { mode: "management", results: [] } };
 	}
-	const topLevelResume = depthState.depth === 0 && !resolveInheritedNestedRouteFromEnv() && !input.deps.state.workflowControllers?.has(input.target.runId);
+	const topLevelResume = depthState.depth === 0 && !inheritedNestedRoute(input.deps) && !input.deps.state.workflowControllers?.has(input.target.runId);
 	let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
 	try {
 		activeAsyncCapacity = topLevelResume ? acquireActiveAsyncCapacity({
@@ -1679,13 +1694,14 @@ async function resumeExternalJobFollowUp(input: {
 			modelScope: input.modelScope,
 			interactive: input.ctx.hasUI,
 			permissions: input.deps.config.permissions,
+			childRuntime: input.deps.childRuntime,
 		}),
 		cwd: input.effectiveCwd,
 		artifactsDir,
 		artifactConfig,
 		shareEnabled: false,
 		...(input.parentSessionFile ? { sessionRoot: input.deps.getSubagentSessionRoot(input.parentSessionFile) } : {}),
-		maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth),
+		maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 		waitToolEnabled: input.deps.waitToolEnabled,
 		waitToolDefaultTimeoutMs: input.deps.waitToolDefaultTimeoutMs,
 		worktreeSetupHook: input.deps.config.worktreeSetupHook,
@@ -1796,7 +1812,7 @@ async function resumeAsyncRun(input: {
 		};
 	}
 
-	const { blocked, depth, maxDepth } = checkSubagentDepth(input.deps.config.maxSubagentDepth);
+	const { blocked, depth, maxDepth } = checkSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime);
 	if (blocked) {
 		return {
 			content: [{ type: "text", text: `Nested subagent resume blocked (depth=${depth}, max=${maxDepth}). Complete the follow-up directly instead.` }],
@@ -1885,7 +1901,7 @@ async function resumeAsyncRun(input: {
 			};
 		}
 		const runId = randomUUID();
-		const topLevelResume = depth === 0 && !resolveInheritedNestedRouteFromEnv() && !input.params.workflowParentRunId;
+		const topLevelResume = depth === 0 && !inheritedNestedRoute(input.deps) && !input.params.workflowParentRunId;
 		let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
 		try {
 			activeAsyncCapacity = topLevelResume ? acquireActiveAsyncCapacity({
@@ -1931,6 +1947,7 @@ async function resumeAsyncRun(input: {
 				modelScope,
 				interactive: input.ctx.hasUI,
 		permissions: input.deps.config.permissions,
+		childRuntime: input.deps.childRuntime,
 			}),
 			availableModels,
 			cwd: effectiveCwd,
@@ -1943,7 +1960,7 @@ async function resumeAsyncRun(input: {
 			agentContract: input.params.agentContract,
 			fast: input.params.fast,
 			dynamicFanoutMaxItems: input.deps.config.chain?.dynamicFanout?.maxItems,
-			maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth),
+			maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 			waitToolEnabled: input.deps.waitToolEnabled,
 			waitToolDefaultTimeoutMs: input.deps.waitToolDefaultTimeoutMs,
 			worktreeSetupHook: input.deps.config.worktreeSetupHook,
@@ -1986,7 +2003,7 @@ async function resumeAsyncRun(input: {
 		return { content: [{ type: "text", text: `Async child '${target.runId}' is missing its required run fan-out recovery identity. Start a new run instead.` }], isError: true, details: { mode: "management", results: [] } };
 	}
 	const runId = randomUUID();
-	const topLevelResume = depth === 0 && !resolveInheritedNestedRouteFromEnv() && !input.params.workflowParentRunId;
+	const topLevelResume = depth === 0 && !inheritedNestedRoute(input.deps) && !input.params.workflowParentRunId;
 	let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
 	try {
 		activeAsyncCapacity = !topLevelResume ? undefined : target.source === "async"
@@ -2034,6 +2051,7 @@ async function resumeAsyncRun(input: {
 			modelScope,
 			interactive: input.ctx.hasUI,
 		permissions: input.deps.config.permissions,
+		childRuntime: input.deps.childRuntime,
 		}),
 		cwd: effectiveCwd,
 		maxOutput: input.params.maxOutput ?? recoveryDescriptor?.maxOutput,
@@ -2058,7 +2076,7 @@ async function resumeAsyncRun(input: {
 		thinkingCeiling: recoveryDescriptor?.thinkingCeiling ?? ("thinkingCeiling" in target ? target.thinkingCeiling : undefined),
 		extensionBindings: recoveryDescriptor?.extensionBindings ?? ("extensionBindings" in target ? target.extensionBindings : undefined),
 		outputBaseDir: resolveSingleRunOutputBaseDir(input.deps, artifactsDir, runId),
-		maxSubagentDepth: recoveryDescriptor?.maxSubagentDepth ?? resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth),
+		maxSubagentDepth: recoveryDescriptor?.maxSubagentDepth ?? resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 		waitToolEnabled: input.deps.waitToolEnabled,
 		waitToolDefaultTimeoutMs: input.deps.waitToolDefaultTimeoutMs,
 		worktreeSetupHook: input.deps.config.worktreeSetupHook,
@@ -3187,9 +3205,10 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		modelScope: data.modelScope,
 		interactive: ctx.hasUI,
 		permissions: deps.config.permissions,
+		childRuntime: deps.childRuntime,
 	});
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth, deps.childRuntime);
 	const currentProvider = parentModel?.provider;
 	const controlIntercomTarget = resolveRunLevelIntercomTarget(intercomBridge, contextPolicy);
 	const childIntercomTarget = resolveChildIntercomTargetFactory(intercomBridge, contextPolicy, id);
@@ -3674,7 +3693,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const rawOutput = params.output !== undefined ? params.output : agentConfig.output;
 	let effectiveOutput = normalizeSingleOutputOverride(rawOutput, agentConfig.output);
 	const effectiveOutputMode = params.outputMode ?? agentConfig.outputMode ?? "inline";
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth, deps.childRuntime);
 	const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, agentConfig.maxSubagentDepth);
 
 
@@ -3741,6 +3760,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	}
 	const interruptController = new AbortController();
 	let detachForeground: ((reason?: string) => boolean) | undefined;
+	let childSessionControls: ForegroundChildSessionControls | undefined;
 	const foregroundControl = deps.state.foregroundControls.get(runId);
 	if (foregroundControl) {
 		const thinking = resolveEffectiveThinking(modelOverride, thinkingOverrideForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin));
@@ -3761,6 +3781,19 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				return true;
 			},
 			detach: () => detachForeground?.("user request") === true,
+			steer: async (input: ForegroundSteerInput): Promise<ForegroundSteerOutcome> => {
+				if (!childSessionControls) return { state: "failed", reason: CHILD_SESSION_NOT_RUNNING_YET };
+				try {
+					if (input.mode === "follow_up") {
+						await childSessionControls.followUp(input.message);
+						return { state: "queued" };
+					}
+					await childSessionControls.steer(input.message);
+					return { state: "delivered" };
+				} catch (error) {
+					return { state: "failed", reason: error instanceof Error ? error.message : String(error) };
+				}
+			},
 		}));
 	}
 
@@ -3783,7 +3816,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			runtimeSnapshotHost: deps.pi,
 			parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
 			llmIntentArbiter: createTaskMutationArbiter(ctx),
-			...workflowForegroundSteeringLaunchOptions(foregroundControl, 0),
+			childRuntime: deps.childRuntime,
+			onChildSession: (controls) => { childSessionControls = controls; },
 			context: data.contextPolicy.contextForAgent(params.agent!),
 			unknownAgentDiagnosticContext: data.unknownAgentDiagnosticContext,
 			runFanoutBudget: params.runFanoutAdmitted ? data.runFanoutBudget : { ...data.runFanoutBudget, parentPath: `${data.runFanoutBudget.parentPath ? `${data.runFanoutBudget.parentPath}/` : ""}single` },
@@ -4215,6 +4249,7 @@ function workflowSteerReceipt(key: string, result: AgentToolResult<Details>): Wo
 	};
 }
 
+const CHILD_SESSION_NOT_RUNNING_YET = "Child session is not running yet.";
 const MAX_WORKFLOW_RESUME_HINT_BYTES = 1024;
 const MAX_WORKFLOW_CHILD_RUN_ID_BYTES = 256;
 const WORKFLOW_RESUME_HINT_PARENT_STATES = new Set(["complete", "failed", "partial"]);
@@ -4350,7 +4385,6 @@ export async function steerWorkflowChildByKey(input: {
 	while (true) {
 		const control = [...input.state.foregroundControls.values()].find((candidate) => candidate.parentWorkflowRunId === input.workflowRunId
 			&& candidate.workflowKey === input.key
-			&& Boolean(candidate.workflowSteeringDir)
 			&& (candidate.activeChildren?.size ?? 0) > 0);
 		if (control) {
 			const result = await steerWorkflowForegroundTarget({
@@ -4358,10 +4392,9 @@ export async function steerWorkflowChildByKey(input: {
 				message: input.message,
 				mode: input.options.mode,
 				index: input.options.index,
-				ackTimeoutMs: Math.max(1, deadline - Date.now()),
-				signal: input.signal,
 			});
-			return workflowSteerReceipt(input.key, result);
+			// The control registers before its child session exists; keep polling until the steer can route.
+			if (!result.details.steering?.targets.some((target) => target.reason === CHILD_SESSION_NOT_RUNNING_YET) || Date.now() >= deadline) return workflowSteerReceipt(input.key, result);
 		}
 
 		const workflowStatus = readStatus(path.join(asyncDirRoot, input.workflowRunId));
@@ -4817,11 +4850,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const scriptFirstLine = requestParams.workflowScript.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Workflow";
 			const boundedScriptPreview = scriptFirstLine.length > 100 ? `${scriptFirstLine.slice(0, 97)}...` : scriptFirstLine;
 			const derivedObjective = previewAgent ? `Workflow: ${previewAgent}` : boundedScriptPreview;
-			const workflowDepth = checkSubagentDepth(deps.config.maxSubagentDepth).depth;
+			const workflowDepth = checkSubagentDepth(deps.config.maxSubagentDepth, deps.childRuntime).depth;
 			const asyncWorkflow = requestParams.async !== false;
 			const topLevelAsyncWorkflow = asyncWorkflow
 				&& workflowDepth === 0
-				&& !resolveInheritedNestedRouteFromEnv()
+				&& !inheritedNestedRoute(deps)
 				&& !requestParams.workflowParentRunId;
 			const workflowRunId = asyncWorkflow ? randomUUID() : undefined;
 			let workflowCapacity: ActiveAsyncCapacityHandle | undefined;
@@ -4846,7 +4879,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			let workflowFanoutBudget: RunFanoutBudgetDescriptor;
 			try {
 				workflowFanoutBudget = requestParams.runFanoutBudget
-					?? decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV])
+					?? inheritedRunFanoutBudget(deps)
 					?? createRunFanoutBudget(_id, requestParams.maxSubagentSpawnsPerRun ?? resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun));
 			} catch (error) {
 				workflowCapacity?.rollback();
@@ -5998,7 +6031,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						if (directoryStatus?.mode === "workflow") {
 							const route = resolveWorkflowForegroundSteeringTarget({ state: deps.state, workflowRunId: directoryStatus.runId || runId, asyncDirRoot: DIRS.async });
 							if (!route.ok) return { content: [{ type: "text", text: route.message }], isError: true, details: { mode: "management", results: [] } };
-							return steerWorkflowForegroundTarget({ target: route.target, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index, signal });
+							return steerWorkflowForegroundTarget({ target: route.target, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index });
 						}
 						if (location.asyncDir) {
 							const unsupported = externalRunnerControlError(location.asyncDir, "steer");
@@ -6038,14 +6071,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				if (resolved?.kind === "foreground") {
 					const route = resolveWorkflowForegroundSteeringTarget({ state: deps.state, childRunId: resolved.id, asyncDirRoot: DIRS.async });
 					if (!route.ok) return { content: [{ type: "text", text: route.message }], isError: true, details: { mode: "management", results: [] } };
-					return steerWorkflowForegroundTarget({ target: route.target, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index, signal });
+					return steerWorkflowForegroundTarget({ target: route.target, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index });
 				}
 				if (resolved?.kind !== "async") return { content: [{ type: "text", text: `No async run found for '${targetRunId}'.` }], isError: true, details: { mode: "management", results: [] } };
 				const resolvedStatus = resolved.location.asyncDir ? readStatus(resolved.location.asyncDir) : null;
 				if (resolvedStatus?.mode === "workflow") {
 					const route = resolveWorkflowForegroundSteeringTarget({ state: deps.state, workflowRunId: resolvedStatus.runId || resolved.id, asyncDirRoot: DIRS.async });
 					if (!route.ok) return { content: [{ type: "text", text: route.message }], isError: true, details: { mode: "management", results: [] } };
-					return steerWorkflowForegroundTarget({ target: route.target, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index, signal });
+					return steerWorkflowForegroundTarget({ target: route.target, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index });
 				}
 				if (resolved.location.asyncDir) {
 					const unsupported = externalRunnerControlError(resolved.location.asyncDir, "steer");
@@ -6254,7 +6287,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			});
 		}
 
-		const { blocked, depth, maxDepth } = checkSubagentDepth(deps.config.maxSubagentDepth);
+		const { blocked, depth, maxDepth } = checkSubagentDepth(deps.config.maxSubagentDepth, deps.childRuntime);
 		if (blocked) {
 			return {
 				content: [
@@ -6329,8 +6362,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		});
 		const agents = applyScopedIntercomBridgeToAgents(discoveredAgents, intercomBridge, contextPolicy);
 		const runId = randomUUID();
-		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
-		const nestedParentAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+		const inheritedNestedRouteValue = inheritedNestedRoute(deps);
+		const nestedParentAddress = inheritedNestedRouteValue ? inheritedNestedParentAddress(deps) : undefined;
 		const shareEnabled = effectiveParams.share === true;
 		const hasChain = (effectiveParams.chain?.length ?? 0) > 0;
 		const hasTasks = (effectiveParams.tasks?.length ?? 0) > 0;
@@ -6451,7 +6484,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const asyncRunId = requestedWorkflowChildAsyncId && path.basename(requestedWorkflowChildAsyncId) === requestedWorkflowChildAsyncId
 			? requestedWorkflowChildAsyncId
 			: randomUUID();
-		const topLevelAsyncCapacityEligible = depth === 0 && !inheritedNestedRoute && !effectiveParams.workflowParentRunId;
+		const topLevelAsyncCapacityEligible = depth === 0 && !inheritedNestedRouteValue && !effectiveParams.workflowParentRunId;
 		const topLevelAsync = effectiveAsync && topLevelAsyncCapacityEligible;
 		let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
 		if (topLevelAsync) {
@@ -6476,9 +6509,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 
 		let runFanoutBudget: RunFanoutBudgetDescriptor;
 		try {
-			const inheritedRunFanoutBudget = effectiveParams.runFanoutBudget ? undefined : decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV]);
+			const inheritedRunFanoutBudgetValue = effectiveParams.runFanoutBudget ? undefined : inheritedRunFanoutBudget(deps);
 			runFanoutBudget = effectiveParams.runFanoutBudget
-				?? (inheritedRunFanoutBudget ? { ...inheritedRunFanoutBudget, parentPath: `${inheritedRunFanoutBudget.parentPath ? `${inheritedRunFanoutBudget.parentPath}/` : ""}${runId}` } : undefined)
+				?? (inheritedRunFanoutBudgetValue ? { ...inheritedRunFanoutBudgetValue, parentPath: `${inheritedRunFanoutBudgetValue.parentPath ? `${inheritedRunFanoutBudgetValue.parentPath}/` : ""}${runId}` } : undefined)
 				?? createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun));
 			if (!effectiveParams.runFanoutAdmitted) claimRunFanoutBatch(runFanoutBudget, staticRunFanoutPaths(effectiveParams));
 		} catch (error) {
@@ -6486,7 +6519,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (error instanceof RunFanoutLimitError) return runFanoutErrorResult(error, foregroundMode);
 			return buildRequestedModeError(effectiveParams, error instanceof Error ? error.message : String(error));
 		}
-		const nestedRoute = inheritedNestedRoute ?? createNestedRoute(runId);
+		const nestedRoute = inheritedNestedRouteValue ?? createNestedRoute(runId);
 
 		const artifactConfig: ArtifactConfig = omitUndefinedProperties({
 			...DEFAULT_ARTIFACT_CONFIG,
@@ -6658,17 +6691,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const foregroundDescription = selectedAgentNames.length === 1
 			? `${selectedAgentNames[0]} child`
 			: `${selectedAgentNames.length} live children`;
-		const parentWorkflowStatus = effectiveParams.workflowParentRunId
-			? readStatus(path.join(DIRS.async, effectiveParams.workflowParentRunId))
-			: null;
-		const workflowSteeringDir = effectiveParams.workflowParentRunId
-			&& requestSessionId
-			&& deps.state.workflowControllers?.has(effectiveParams.workflowParentRunId)
-			&& parentWorkflowStatus?.mode === "workflow"
-			&& (parentWorkflowStatus.state === "running" || parentWorkflowStatus.state === "queued")
-			&& parentWorkflowStatus.sessionId === requestSessionId
-			? workflowForegroundSteeringDir(DIRS.async, effectiveParams.workflowParentRunId, runId)
-			: undefined;
 		const foregroundControl: ForegroundRunControl | undefined = effectiveAsync
 			? undefined
 			: compactOptional<ForegroundRunControl>({
@@ -6677,7 +6699,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				mode: foregroundMode,
 				...(effectiveParams.workflowParentRunId ? { parentWorkflowRunId: effectiveParams.workflowParentRunId } : {}),
 				...(effectiveParams.workflowKey ? { workflowKey: effectiveParams.workflowKey } : {}),
-				workflowSteeringDir,
 				startedAt: Date.now(),
 				updatedAt: Date.now(),
 				cwd: effectiveCwd,
@@ -6730,7 +6751,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 
 		const writeNestedForegroundEvent = (type: "subagent.nested.started" | "subagent.nested.completed", result?: AgentToolResult<Details>): void => {
-			if (!inheritedNestedRoute || !nestedParentAddress) return;
+			if (!inheritedNestedRouteValue || !nestedParentAddress) return;
 			const now = Date.now();
 			const details = result?.details;
 			const state = type === "subagent.nested.started"
@@ -6764,7 +6785,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				? resolveSubagentIntercomTarget(runId, agentsForSummary[0], 0)
 				: undefined;
 			try {
-				writeNestedEvent(inheritedNestedRoute, compactOptional<Parameters<typeof writeNestedEvent>[1]>({
+				writeNestedEvent(inheritedNestedRouteValue, compactOptional<Parameters<typeof writeNestedEvent>[1]>({
 					type,
 					ts: now,
 					parentRunId: nestedParentAddress.parentRunId,
@@ -6775,7 +6796,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						parentStepIndex: nestedParentAddress.parentStepIndex,
 						depth: nestedParentAddress.depth,
 						path: nestedParentAddress.path,
-						ownerIntercomTarget: process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME,
+						ownerIntercomTarget: deps.childRuntime?.intercomSessionName,
 						leafIntercomTarget,
 						intercomTarget: leafIntercomTarget,
 						ownerState: state === "running" ? "live" : "gone",
@@ -6886,7 +6907,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const normalizedAction = typeof params.action === "string" ? params.action.trim() : params.action;
 		const requestParams = normalizedAction ? { ...params, action: normalizedAction } : params;
 		if (normalizedAction) return execute(id, requestParams, signal, onUpdate, ctx).then(withAggregatedToolUsage);
-		const { depth } = checkSubagentDepth(deps.config.maxSubagentDepth);
+		const { depth } = checkSubagentDepth(deps.config.maxSubagentDepth, deps.childRuntime);
 		const dispatchParams = applyForceTopLevelAsyncOverride(requestParams, depth, deps.config.forceTopLevelAsync === true);
 		const runsForeground = dispatchParams.clarify === true || (dispatchParams.async ?? deps.asyncByDefault) !== true;
 		if (!runsForeground) return execute(id, requestParams, signal, onUpdate, ctx).then(withAggregatedToolUsage);

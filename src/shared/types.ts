@@ -1160,15 +1160,6 @@ export interface AcceptanceLedger {
 	};
 }
 
-export interface ProtocolOutputLimit {
-	code: "protocol_output_limit";
-	stream: "stdout" | "stderr";
-	limitBytes: number;
-	observedBytes: number;
-	diagnosticPrefix: string;
-	diagnosticTail: string;
-}
-
 export interface LaunchResolvedChildExtensionsV1 {
 	version: 1;
 	/** This is parent-resolved launch intent, not child-runtime acknowledgement that extensions loaded. */
@@ -1263,7 +1254,6 @@ export interface SingleResult {
 	 * a signal to reduce input size or re-decompose the task.
 	 */
 	contextOverflow?: boolean;
-	protocolError?: ProtocolOutputLimit;
 	sessionFile?: string;
 	skills?: string[];
 	skillsWarning?: string;
@@ -2108,6 +2098,18 @@ export interface ForegroundChildControl {
 	toolCount?: number;
 	interrupt?: () => boolean;
 	detach?: () => boolean;
+	/** Steer the live in-process child session; undefined until the session exists. */
+	steer?: (input: ForegroundSteerInput) => Promise<ForegroundSteerOutcome>;
+}
+
+export interface ForegroundSteerInput {
+	message: string;
+	mode?: "steer" | "follow_up" | "auto";
+}
+
+export interface ForegroundSteerOutcome {
+	state: "delivered" | "queued" | "failed";
+	reason?: string;
 }
 
 export interface ForegroundRunControl {
@@ -2116,8 +2118,6 @@ export interface ForegroundRunControl {
 	parentWorkflowRunId?: string;
 	/** Stable workflow lane key for this live foreground child. */
 	workflowKey?: string;
-	/** Private control root used to steer a live workflow-owned child. */
-	workflowSteeringDir?: string;
 	/** Originating parent session; required for public fleet projection. */
 	sessionId?: string;
 	mode: SubagentRunMode;
@@ -2159,6 +2159,7 @@ export interface ForegroundRunControl {
 	nestedChildren?: NestedRunSummary[];
 	interrupt?: () => boolean;
 	detach?: () => boolean;
+	steer?: ForegroundChildControl["steer"];
 }
 
 export interface WaitSubscriptionRecord {
@@ -2319,17 +2320,25 @@ export interface SubagentChildStatusEvent {
 // Execution Options
 // ============================================================================
 
+/** Live controls for one in-process foreground child session. */
+export interface ForegroundChildSessionControls {
+	steer: (text: string) => Promise<void>;
+	followUp: (text: string) => Promise<void>;
+}
+
 export interface RunSyncOptions {
 	/** Exact discovery provenance for an unknown-agent error; omission uses defensive fallback discovery. */
 	unknownAgentDiagnosticContext?: import("../agents/agents.ts").UnknownAgentDiagnosticContext;
+	/** Session factory for the in-process child; defaults to the process-wide factory. */
+	childSessionFactory?: import("../runs/shared/child-session.ts").ChildSessionFactory;
+	/** The launching executor's own child runtime when it is itself an in-process child. */
+	childRuntime?: import("../runs/shared/child-runtime-config.ts").ChildRuntimeConfig;
+	/** Fires once the child session exists and can be steered. */
+	onChildSession?: (controls: ForegroundChildSessionControls) => void;
 	/** Opt-in global permission rules; missing tools remain allowed. */
 	permissions?: import("../runs/shared/permissions.ts").PermissionConfig;
 	/** Session id of the direct parent session for permission-system ask forwarding. */
 	parentSessionId?: string;
-	/** Private prompt-runtime steering transport for workflow-owned foreground children. */
-	steerInboxDir?: string;
-	steerCapabilityPath?: string;
-	steerAckDir?: string;
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	cwd?: string;
@@ -2411,6 +2420,7 @@ export interface RunSyncOptions {
 		schemaPath: string;
 		outputPath: string;
 		acceptanceReportPath?: string;
+		acceptanceReportRequired?: boolean;
 	};
 	agentContract?: AgentContract;
 	acceptance?: AcceptanceInput;
@@ -2766,8 +2776,17 @@ export function normalizeMaxSubagentDepth(value: unknown): number | undefined {
 	return normalizeNonNegativeInteger(value);
 }
 
-export function resolveCurrentMaxSubagentDepth(configMaxDepth?: number): number {
-	return normalizeMaxSubagentDepth(process.env.PI_SUBAGENT_MAX_DEPTH)
+/** Depth context of the executor's own child runtime, when it runs as an in-process child. */
+export interface SubagentDepthContext {
+	depth: number;
+	maxDepth?: number;
+}
+
+/** Operator override for the top-level parent; children inherit their limit through their runtime config. */
+export const SUBAGENT_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
+
+export function resolveCurrentMaxSubagentDepth(configMaxDepth?: number, runtime?: SubagentDepthContext): number {
+	return normalizeMaxSubagentDepth(runtime ? runtime.maxDepth : process.env[SUBAGENT_MAX_DEPTH_ENV])
 		?? normalizeMaxSubagentDepth(configMaxDepth)
 		?? DEFAULT_SUBAGENT_MAX_DEPTH;
 }
@@ -2778,19 +2797,24 @@ export function resolveChildMaxSubagentDepth(parentMaxDepth: number, agentMaxDep
 	return normalizedAgent === undefined ? normalizedParent : Math.min(normalizedParent, normalizedAgent);
 }
 
-export function checkSubagentDepth(configMaxDepth?: number): { blocked: boolean; depth: number; maxDepth: number } {
-	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-	const maxDepth = resolveCurrentMaxSubagentDepth(configMaxDepth);
-	const blocked = Number.isFinite(depth) && depth >= maxDepth;
+/** Depth of the executor itself: 0 for a top-level parent, its own child depth otherwise. */
+export function resolveCurrentSubagentDepth(runtime?: SubagentDepthContext): number {
+	const depth = runtime ? runtime.depth : 0;
+	return Number.isFinite(depth) ? depth : 0;
+}
+
+export function checkSubagentDepth(configMaxDepth?: number, runtime?: SubagentDepthContext): { blocked: boolean; depth: number; maxDepth: number } {
+	const depth = resolveCurrentSubagentDepth(runtime);
+	const maxDepth = resolveCurrentMaxSubagentDepth(configMaxDepth, runtime);
+	const blocked = depth >= maxDepth;
 	return { blocked, depth, maxDepth };
 }
 
-export function getSubagentDepthEnv(maxDepth?: number): Record<string, string> {
-	const parentDepth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-	const nextDepth = Number.isFinite(parentDepth) ? parentDepth + 1 : 1;
+/** Depth context handed to a child launched by an executor at `runtime` (undefined for a top-level parent). */
+export function resolveChildDepth(maxDepth?: number, runtime?: SubagentDepthContext): Required<SubagentDepthContext> {
 	return {
-		PI_SUBAGENT_DEPTH: String(nextDepth),
-		PI_SUBAGENT_MAX_DEPTH: String(normalizeMaxSubagentDepth(maxDepth) ?? resolveCurrentMaxSubagentDepth()),
+		depth: resolveCurrentSubagentDepth(runtime) + 1,
+		maxDepth: normalizeMaxSubagentDepth(maxDepth) ?? resolveCurrentMaxSubagentDepth(undefined, runtime),
 	};
 }
 

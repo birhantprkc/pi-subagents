@@ -56,7 +56,8 @@ import { createWaitSubscriptionManager } from "../runs/background/wait-subscript
 import { drainOutstandingWork } from "../runs/background/auto-drain.ts";
 import registerSubagentNotify, { parseSubagentNotifyContent, type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
+import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.ts";
+import { disposeChildSessions } from "../runs/shared/child-session.ts";
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { applyModelExclusionsConfig, loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
@@ -907,10 +908,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const projectPaneOwnerRoot = path.resolve(ctx.cwd);
 		restoreHerdrProjectPaneSnapshots(state, [...new Set([...(state.herdrProjectPanes?.keys() ?? []), ...listHerdrProjectPaneRoots(projectPaneOwnerRoot), projectPaneOwnerRoot])]);
 		// Set PI_SUBAGENT_PARENT_SESSION for permission-system forwarding.
-		// Only set in the root session (the interactive UI session), not in
-		// child subagent processes — children inherit the parent's value
-		// through the process environment at spawn time and must not overwrite
-		// it with their own session identity.
+		// Only set in the root session (the interactive UI session), not in a
+		// child host: the runner process inherits the parent's value through
+		// its environment at spawn time and must not overwrite it with a child
+		// session's identity.
 		if (!process.env[SUBAGENT_CHILD_ENV]) {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (sessionId) {
@@ -1089,6 +1090,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		runtimeEntry.cleanup();
+		try {
+			await disposeChildSessions();
+		} catch (error) {
+			console.error("Failed to dispose in-process child sessions:", error);
+		}
 		await herdrStatusBridge.flush();
 	});
 }

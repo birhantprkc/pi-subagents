@@ -6,6 +6,10 @@ Where running subagents show up, how to inspect them, and the files and events t
 
 Foreground runs stream progress in the conversation while they run. They default to a generous 30-minute wall-clock timeout when neither the call nor the selected agent provides a timeout; a global [`timeoutMs`](configuration.md#timeoutms) config replaces that default, and explicit `timeoutMs`/`maxRuntimeMs` and agent defaults win.
 
+A foreground child is a pi session created inside the parent Pi process, not a second `pi` process. All foreground children of one parent share one model runtime, created on the first launch and released when the parent session shuts down. The child loads pi-subagents' own hooks (prompt runtime, fast mode, fanout) as inline extensions, plus the agent's configured `extensions`, `subagentOnlyExtensions`, path-like `tools` entries, and the permission-system extension when permission rules apply; it never loads the parent's ambient extensions. The task is delivered as the session prompt and the system prompt is passed to the session directly. A run timeout, tool timeout, interrupt, or stop aborts the child session and disposes it. Detach keeps the session running inside the parent and publishes the same receipt and completion notification as before.
+
+A background child is a pi session created inside the detached runner process. The runner builds the same launch (hooks, tool plan, typed runtime config) from the step it received in its config, mirrors the session's events into `events.jsonl`, `output-<index>.log`, and the transcript, and consumes the parent's file control inbox: interrupt and stop abort the child session, and steer requests are delivered with the session's `steer` or `followUp`. Background children load the parent's ambient extensions unless the agent sets `extensions` or the capability ceiling denies extensions; foreground children never do.
+
 Live progress shows compact detail for single, chain, and parallel modes: a bounded one-line task, current tool, recent output, token counts, aggregate cost, duration, activity freshness, current-tool duration, and chain graph metadata when available. Workflow `label` metadata wins over raw task text in compact multi-child cards.
 
 Press Pi's configured expand key (`Ctrl+O` by default) to expand the full streaming view with complete output per step. Running-card hints also advertise `Ctrl+Alt+F` for the Fleet inspector.
@@ -56,7 +60,7 @@ After you expand it:
 
 When the focused editor is empty, press `↓` or `←` to expand the summary into `main` plus active children with agent name, state, elapsed time, and token usage. When providers report usage, `window` is the latest assistant turn's input plus cache-read tokens, while `spent` keeps the cumulative input-plus-output total. Old run artifacts without window data keep the existing token-total label. The compact line counts active current-session work and Herdr project panes. Then use `↑`/`↓` or `j`/`k` to select a child and `Enter` to open the Fleet lobby; press `Enter` or `H` there to open its child-specific Herdr inspector. Printable navigation keys are never intercepted before activation.
 
-FleetView replaces the legacy above-editor async widget by default. Successful background completions stay quiet so inactive Pi tabs are not marked unread, while failed or paused completions still notify the originating session. Parallel runs show every active child independently. Chains with parallel groups keep their grouped shape in progress and results, so failed or paused agents stay visible next to completed ones. When a child is explicitly allowed to fan out with `tools: subagent` or `allowNestedSubagents: true`, its nested runs appear under that parent child in the main status tree instead of being hidden inside the child process.
+FleetView replaces the legacy above-editor async widget by default. Successful background completions stay quiet so inactive Pi tabs are not marked unread, while failed or paused completions still notify the originating session. Parallel runs show every active child independently. Chains with parallel groups keep their grouped shape in progress and results, so failed or paused agents stay visible next to completed ones. When a child is explicitly allowed to fan out with `tools: subagent` or `allowNestedSubagents: true`, its nested runs appear under that parent child in the main status tree instead of being hidden inside the child session.
 
 ## The fleet inspector
 
@@ -187,7 +191,7 @@ The status/result fields are: `lifecycleArtifactVersion`, `runId`/`id`, `session
 
 ### Runtime extension acknowledgement
 
-Cooperating child extensions can acknowledge child-runtime registration by emitting `subagent:acknowledge-extension` on the child process `pi.events` bus with payload `{ id: string }`.
+Cooperating child extensions can acknowledge child-runtime registration by emitting `subagent:acknowledge-extension` on the child session's `pi.events` bus with payload `{ id: string }`. The process that hosts the child session (the parent for foreground children, the runner for background children) captures the acknowledgement in memory.
 
 Acknowledgement ids are self-declared opaque strings. They must be non-empty, at most 128 characters, contain only `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `@`, `+`, or `-`, and must not contain `/`, `\`, or `..`.
 
@@ -201,19 +205,13 @@ The reported `runtimeAcknowledgedExtensions` projection is `{ version: 1, source
 
 Lifecycle artifact v3 adds `process-terminal-candidate.json` (private runner evidence) and `process-terminal.json` (the public proof projection).
 
-A proof is `observed` only after the live parent observes the exact detached runner's `close` event, every recorded child writer has a close record, and any tracked canonical-session lease is free. If the observer is unavailable, the proof is `unknown`; do not infer process exit from `endedAt`, result-file existence, PID disappearance, or lease-directory absence.
+A proof is `observed` only after the live parent observes the exact detached runner's `close` event and any tracked canonical-session lease is free. Children run inside the runner process, so the candidate records no separate writer processes. If the observer is unavailable, the proof is `unknown`; do not infer process exit from `endedAt`, result-file existence, PID disappearance, or lease-directory absence.
 
 The `subagent:process-terminal` event and RPC `ping.capabilities.processTerminalProof` expose this status. Process proof is point-in-time evidence and remains separate from execution success or stopped/non-resumable state.
 
-### Child-protocol bounds
+### Child session events
 
-Foreground and async runners share bounded child-protocol handling:
-
-- A child JSONL line above 16 MiB fails with structured `protocolError` code `protocol_output_limit`. Oversized Pi `turn_end` and `agent_end` aggregates are the exception because they duplicate granular events, so runners replace them with bounded lifecycle records while preserving `agent_end.willRetry`.
-- Stderr retains only its latest 128 KiB.
-- Split UTF-8 and final unterminated JSON events remain valid.
-- `agent_end.willRetry` defers completion until the child settles.
-- Current Pi builds use `agent_settled` as the terminal watermark; older builds retain the bounded terminal-message fallback.
+Both launch paths subscribe to the child session's event stream directly; there is no stdout protocol. The `events.jsonl` artifact mirrors those events with `message_update` dropped, and the transcript records them with `message_update` projected the same way pi's JSON mode prints it. `agent_end.willRetry` defers completion until the child settles, and `agent_settled` is the terminal watermark; a child whose run does not settle shortly after its terminal event is aborted and finished without it.
 
 ## Workflow and debug artifacts
 
@@ -238,7 +236,7 @@ For npm package projects, project-scoped artifacts need a `.npmignore` rule (or 
 
 ## Sessions
 
-Session files are stored under a per-run session directory. With `context: "fork"`, each child starts with `--session <branched-session-file>` produced from the parent's current leaf. That is a real session fork, not an injected summary. An omitted launch `context` that resolves through `defaultContext: fork` uses the same branch when the parent session file and current leaf exist, and otherwise starts fresh.
+Session files are stored under a per-run session directory. With `context: "fork"`, each child starts from a branched session file produced from the parent's current leaf (foreground children open it in-process; background children receive it as `--session`). That is a real session fork, not an injected summary. An omitted launch `context` that resolves through `defaultContext: fork` uses the same branch when the parent session file and current leaf exist, and otherwise starts fresh.
 
 ## Completion notifications
 

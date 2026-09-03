@@ -99,7 +99,7 @@ If `pi-subagents` is a resolvable dependency of the consumer package, `pi-subage
 
 The installed owner applies the existing runtime-agent validation, collision checks, limits, runtime source metadata, and cleanup. If more than one owner listens, the first handler that writes `request.result` wins. Unsupported versions, malformed requests, and registration failures return `{ ok: false, error }`. No result means no compatible owner handled the event.
 
-This contract is process-local. It does not register agents in child processes or other Pi processes, and it does not change package discovery or package resolution.
+This contract is process-local. It does not register agents in child sessions or other Pi processes, and it does not change package discovery or package resolution.
 
 ## External jobs in FleetView
 
@@ -309,7 +309,9 @@ Semantics:
 - Providers share a registry through `Symbol.for("pi-subagents.background-work.v1")`, allowing independently loaded extension modules to meet in one Pi process.
 - Registration is reload-safe: a new provider with the same name replaces the old callback, and the old disposer cannot remove the replacement. Call the disposer during extension shutdown when possible.
 
-Child processes do not gain provider tools or extensions automatically. Add `bg_wait` to the child agent's `tools` allowlist and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting is serialized through foreground, async, resume, chain, parallel, and fanout launch paths; `PI_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence.
+Children do not gain provider tools or extensions automatically. Add `bg_wait` to the child agent's `tools` allowlist and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting reaches every child through its typed runtime config; `PI_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence in the parent.
+
+Foreground children never load the parent's ambient extensions: they share the parent's process, and loading them would start a second copy of every ambient extension, including this one, inside it. Agents that need MCP tools (`mcpDirectTools`, or MCP tools from an ambient adapter such as pi-mcp-adapter) or models from a provider extension must run as background children (`async: true`), which load the ambient extensions inside the detached runner process unless the agent sets `extensions` or the capability ceiling denies extensions.
 
 ## External job provider bridge
 
@@ -363,7 +365,7 @@ subagent({ action: "inspector.status", id: "<run-id>", index: 0 })
 subagent({ action: "inspector.close", id: "<run-id>", index: 0 })
 ```
 
-The inspector is a raw dashboard pane, not the child process and not a literal attach. It reads lifecycle/status/output/mission artifacts and sends `steer` or `stop` through pi-subagents' existing control inbox. Closing it never stops the run.
+The inspector is a raw dashboard pane, not the child session and not a literal attach. It reads lifecycle/status/output/mission artifacts and sends `steer` or `stop` through pi-subagents' existing control inbox. Closing it never stops the run.
 
 Herdr remains optional. Ordinary launches stay headless, and missing/older Herdr versions affect only Herdr-specific inspector and project-pane actions. FleetView opens the selected active async child with `H`. Use `focus` only with `inspector.open`; Herdr 0.7.5 cannot focus an arbitrary existing raw pane id.
 
@@ -431,8 +433,15 @@ The main runtime files in this repository:
 | `src/extension/index.ts` | Extension registration, tool registration, message/render wiring. |
 | `src/agents/agents.ts` | Agent and chain discovery, frontmatter parsing. |
 | `src/runs/foreground/subagent-executor.ts` | Main execution routing for single, parallel, chain, management, status, interrupt, and doctor actions. |
-| `src/runs/foreground/execution.ts` | Core foreground `runSync` handling. |
-| `src/runs/background/subagent-runner.ts` | Detached async runner. |
+| `src/runs/foreground/execution.ts` | Core foreground `runSync` handling: drives one in-process child session per attempt. |
+| `src/runs/shared/child-session.ts` | In-process child session factory (`createAgentSession` behind an injectable seam) and the shared model runtime; used by both launch paths. |
+| `src/runs/shared/child-launch.ts` | Builds the tool plan, typed child runtime config, and session launch for a child in either host process. |
+| `src/runs/shared/child-tool-plan.ts` | Tool, MCP, and extension resolution for a child launch. |
+| `src/runs/shared/child-runtime-config.ts` | `ChildRuntimeConfig`: everything the child-side hooks need. |
+| `src/runs/shared/child-hooks.ts` | The inline hook extensions every child gets (prompt runtime, fast mode, fanout). |
+| `src/runs/background/subagent-runner.ts` | Detached async runner; hosts background child sessions in its own process. |
+| `src/runs/background/run-child-session.ts` | Drives one background child session and mirrors its events into the run artifacts. |
+| `src/runs/background/runner-aliases.ts` | Aliases the host peer packages to the installed pi package for the runner (`JITI_ALIAS`). |
 | `src/runs/background/async-execution.ts` | Background launch support. |
 | `src/runs/background/async-status.ts` | Status discovery and formatting for async runs. |
 | `src/workflows/scripted-workflow.ts` / `src/runs/foreground/subagent-executor.ts` | Scripted workflow orchestration and child launch routing. |
@@ -440,4 +449,4 @@ The main runtime files in this repository:
 | `src/runs/shared/worktree.ts` | Git worktree isolation. |
 | `src/intercom/intercom-bridge.ts` | Runtime intercom bridge instructions and diagnostics. |
 | `src/extension/schemas.ts` / `src/shared/types.ts` | Tool schemas, shared types, and event constants. |
-| `test/unit/` / `test/integration/` / `test/e2e/` | Unit, loader-based integration, and real-session E2E tests. |
+| `test/unit/` / `test/integration/` | Unit and loader-based integration tests. |
