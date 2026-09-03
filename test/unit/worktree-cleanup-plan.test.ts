@@ -346,4 +346,173 @@ describe("worktree cleanup plan", () => {
 			fs.rmSync(baseDir, { recursive: true, force: true });
 		}
 	});
+
+	it("treats nested project directory as cleanup containment root", () => {
+		const repo = createRepo("pi-cleanup-plan-nested-root-");
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cleanup-plan-nested-base-"));
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = createWorktrees(repo, "nested-root", 1, { baseDir });
+			const manifestPath = path.join(repo, ".pi", "subagents", "artifacts", "handoff.json");
+			writeManifest({ repo, manifestPath, setup });
+			const plan = buildPlan({ repo, worktreeBaseDir: baseDir, now: 60_000, planId: "nested-root-plan" });
+			assert.equal(plan.baseDirs[0], path.join(baseDir, path.basename(repo)));
+			assert.equal(plan.entries[0]?.decision, "remove");
+			assert.equal(plan.entries[0]?.state, "safe");
+		} finally {
+			removeGeneratedWorktrees(repo, setup);
+			fs.rmSync(repo, { recursive: true, force: true });
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses git toplevel parent as default cleanup root when input.repo is a subdirectory", () => {
+		const repo = createRepo("pi-cleanup-plan-subdir-root-");
+		const previous = process.env.PI_SUBAGENTS_WORKTREE_DIR;
+		delete process.env.PI_SUBAGENTS_WORKTREE_DIR;
+		let setup: WorktreeSetup | undefined;
+		try {
+			fs.mkdirSync(path.join(repo, "packages", "app"), { recursive: true });
+			setup = createWorktrees(repo, "from-subdir", 1, { provider: "native" });
+			const manifestPath = path.join(repo, ".pi", "subagents", "artifacts", "handoff.json");
+			writeManifest({ repo, manifestPath, setup });
+			const plan = buildPlan({ repo: path.join(repo, "packages", "app"), now: 61_500, planId: "subdir-root-plan" });
+			const realRepo = __testables.realpathExisting(repo);
+			assert.equal(plan.baseDirs[0], path.join(path.dirname(realRepo), "worktrees", path.basename(realRepo)));
+			const entry = entriesByPath(plan).get(__testables.realpathExisting(setup.worktrees[0]!.path)) ?? plan.entries[0];
+			assert.equal(entry?.decision, "remove");
+			assert.equal(entry?.state, "safe");
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBAGENTS_WORKTREE_DIR;
+			else process.env.PI_SUBAGENTS_WORKTREE_DIR = previous;
+			removeGeneratedWorktrees(repo, setup);
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("marks flat dedicatedRoot leaves ineligible", () => {
+		const repo = createRepo("pi-cleanup-plan-flat-leaf-");
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cleanup-plan-flat-base-"));
+		const worktreePath = path.join(baseDir, "pi-worktree-flat-0");
+		const branch = "pi-parallel-flat-0";
+		let setup: WorktreeSetup | undefined;
+		try {
+			git(repo, ["worktree", "add", "-b", branch, worktreePath]);
+			setup = {
+				cwd: repo,
+				worktrees: [{
+					path: worktreePath,
+					agentCwd: worktreePath,
+					branch,
+					index: 0,
+					nodeModulesLinked: false,
+					syntheticPaths: [],
+				}],
+				baseCommit: git(repo, ["rev-parse", "HEAD"]),
+			};
+			const manifestPath = path.join(repo, ".pi", "subagents", "artifacts", "handoff.json");
+			writeManifest({ repo, manifestPath, setup, preserved: true });
+			const plan = buildPlan({ repo, worktreeBaseDir: baseDir, now: 62_000, planId: "flat-leaf-plan" });
+			const entry = entriesByPath(plan).get(__testables.realpathExisting(worktreePath)) ?? plan.entries[0];
+			assert.equal(entry?.decision, "keep");
+			assert.equal(entry?.state, "ineligible");
+			assert.match(entry?.reasons.join(" ") ?? "", /outside configured base directory|outside the project worktree directory/i);
+		} finally {
+			removeGeneratedWorktrees(repo, setup);
+			fs.rmSync(repo, { recursive: true, force: true });
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("marks checkout-internal worktrees ineligible when base is the repos parent", () => {
+		const repo = createRepo("pi-cleanup-plan-checkout-internal-");
+		const worktreePath = path.join(repo, "pi-worktree-internal-0");
+		const branch = "pi-parallel-internal-0";
+		let setup: WorktreeSetup | undefined;
+		try {
+			git(repo, ["worktree", "add", "-b", branch, worktreePath]);
+			setup = {
+				cwd: repo,
+				worktrees: [{
+					path: worktreePath,
+					agentCwd: worktreePath,
+					branch,
+					index: 0,
+					nodeModulesLinked: false,
+					syntheticPaths: [],
+				}],
+				baseCommit: git(repo, ["rev-parse", "HEAD"]),
+			};
+			const manifestPath = path.join(repo, ".pi", "subagents", "artifacts", "handoff.json");
+			writeManifest({ repo, manifestPath, setup, preserved: true });
+			const plan = buildPlan({ repo, worktreeBaseDir: path.dirname(repo), now: 63_000, planId: "checkout-internal-plan" });
+			const entry = entriesByPath(plan).get(__testables.realpathExisting(worktreePath)) ?? plan.entries[0];
+			assert.equal(entry?.decision, "keep");
+			assert.equal(entry?.state, "ineligible");
+			assert.notEqual(entry?.decision, "remove");
+		} finally {
+			removeGeneratedWorktrees(repo, setup);
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a worktree whose project directory resolves into Pi extensions", () => {
+		const repo = createRepo("pi-cleanup-plan-extension-project-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cleanup-plan-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const extensionsDir = path.join(agentDir, "extensions");
+		const baseDir = path.join(tempHome, "worktree-root");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		const projectDir = path.join(baseDir, path.basename(repo));
+		const worktreePath = path.join(projectDir, "pi-worktree-extension-project-0");
+		const branch = "pi-parallel-extension-project-0";
+		let setup: WorktreeSetup | undefined;
+		try {
+			fs.mkdirSync(extensionsDir, { recursive: true });
+			fs.mkdirSync(baseDir, { recursive: true });
+			fs.symlinkSync(extensionsDir, projectDir, process.platform === "win32" ? "junction" : "dir");
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			git(repo, ["worktree", "add", "-b", branch, worktreePath]);
+			setup = {
+				cwd: repo,
+				worktrees: [{ path: worktreePath, agentCwd: worktreePath, branch, index: 0, nodeModulesLinked: false, syntheticPaths: [] }],
+				baseCommit: git(repo, ["rev-parse", "HEAD"]),
+			};
+			const manifestPath = path.join(repo, ".pi", "subagents", "artifacts", "handoff.json");
+			writeManifest({ repo, manifestPath, setup, preserved: true });
+			const plan = buildPlan({ repo, worktreeBaseDir: baseDir, now: 64_000, planId: "extension-project-plan" });
+			const entry = entriesByPath(plan).get(__testables.realpathExisting(worktreePath)) ?? plan.entries[0];
+			assert.equal(entry?.decision, "keep");
+			assert.equal(entry?.state, "ineligible");
+			assert.match(entry?.reasons.join(" ") ?? "", /Pi extensions directory/i);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			removeGeneratedWorktrees(repo, setup);
+			fs.rmSync(repo, { recursive: true, force: true });
+			fs.rmSync(baseDir, { recursive: true, force: true });
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects empty cleanup worktree base directory", () => {
+		const repo = createRepo("pi-cleanup-plan-empty-base-");
+		try {
+			assert.throws(
+				() => buildWorktreeCleanupPlan({ repo, worktreeBaseDir: "   " }),
+				/worktree base directory cannot be empty/,
+			);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
 });

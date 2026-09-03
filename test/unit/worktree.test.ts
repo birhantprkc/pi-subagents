@@ -37,11 +37,19 @@ function createRepo(prefix: string): string {
 	fs.writeFileSync(path.join(repoDir, "tracked.txt"), "initial\n", "utf-8");
 	git(repoDir, ["add", "-A"]);
 	git(repoDir, ["commit", "-m", "initial commit"]);
-	return repoDir;
+	// Match Git's canonical top-level path for macOS symlinked temp roots.
+	return fs.realpathSync(repoDir);
 }
 
-function cleanupRepo(repoDir: string): void {
+function cleanupRepo(repoDir: string, baseDir?: string): void {
+	cleanupProjectWorktrees(repoDir, baseDir);
 	try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}
+}
+
+/** Removes only this repo's nested project folder; never the shared dedicated root. */
+function cleanupProjectWorktrees(repoDir: string, baseDir?: string): void {
+	const dedicatedRoot = baseDir ?? path.join(path.dirname(repoDir), "worktrees");
+	try { fs.rmSync(path.join(dedicatedRoot, path.basename(repoDir)), { recursive: true, force: true }); } catch {}
 }
 
 function createHookScript(_repoDir: string, fileName: string, source: string): string {
@@ -254,9 +262,17 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		git(repoDir, ["commit", "-m", "add nested dir"]);
 
 		try {
+			const repoRoot = git(nestedDir, ["rev-parse", "--show-toplevel"]);
 			assert.equal(
 				resolveExpectedWorktreeAgentCwd(nestedDir, "preview", 2),
-				path.join(os.tmpdir(), "pi-worktree-preview-2", "packages", "app"),
+				path.join(
+					path.dirname(repoRoot),
+					"worktrees",
+					path.basename(repoRoot),
+					"pi-worktree-preview-2",
+					"packages",
+					"app",
+				),
 			);
 		} finally {
 			cleanupRepo(repoDir);
@@ -269,12 +285,14 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		let setup: WorktreeSetup | undefined;
 		try {
 			setup = createWorktrees(repoDir, "base-dir", 1, { baseDir });
-			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, "pi-worktree-base-dir-0"));
+			assert.equal(
+				setup.worktrees[0]!.path,
+				path.join(baseDir, path.basename(repoDir), "pi-worktree-base-dir-0"),
+			);
 			assert.ok(fs.existsSync(baseDir), "configured base directory should be created");
 		} finally {
 			if (setup) cleanupWorktrees(setup);
-			cleanupRepo(repoDir);
-			fs.rmSync(path.dirname(baseDir), { recursive: true, force: true });
+			cleanupRepo(repoDir, baseDir);
 		}
 	});
 
@@ -339,6 +357,84 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
+	it("rejects a final project directory inside Pi extensions", () => {
+		const sourceRepo = createRepo("pi-worktree-extension-project-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const repoDir = path.join(tempHome, "extensions");
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const extensionsDir = path.join(agentDir, "extensions");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		try {
+			fs.renameSync(sourceRepo, repoDir);
+			fs.mkdirSync(extensionsDir, { recursive: true });
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			assert.throws(
+				() => createWorktrees(repoDir, "extension-project", 1, { provider: "native", baseDir: agentDir }),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "extension-project", 0, agentDir),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.deepEqual(git(repoDir, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")), [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.deepEqual(fs.readdirSync(extensionsDir), []);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir);
+			cleanupRepo(sourceRepo);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a project directory symlink into Pi extensions", () => {
+		const repoDir = createRepo("pi-worktree-extension-project-symlink-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const extensionsDir = path.join(agentDir, "extensions");
+		const baseDir = path.join(tempHome, "worktree-root");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		try {
+			fs.mkdirSync(extensionsDir, { recursive: true });
+			fs.mkdirSync(baseDir, { recursive: true });
+			fs.symlinkSync(extensionsDir, path.join(baseDir, path.basename(repoDir)), process.platform === "win32" ? "junction" : "dir");
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			assert.throws(
+				() => createWorktrees(repoDir, "extension-project-symlink", 1, { provider: "native", baseDir }),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "extension-project-symlink", 0, baseDir),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.deepEqual(git(repoDir, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")), [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.deepEqual(fs.readdirSync(extensionsDir), []);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir, baseDir);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
 	it("uses PI_SUBAGENTS_WORKTREE_DIR when no base directory is configured", () => {
 		const repoDir = createRepo("pi-worktree-env-base-dir-");
 		const previous = process.env.PI_SUBAGENTS_WORKTREE_DIR;
@@ -347,7 +443,10 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		try {
 			process.env.PI_SUBAGENTS_WORKTREE_DIR = baseDir;
 			setup = createWorktrees(repoDir, "env-base-dir", 1);
-			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, "pi-worktree-env-base-dir-0"));
+			assert.equal(
+				setup.worktrees[0]!.path,
+				path.join(baseDir, path.basename(repoDir), "pi-worktree-env-base-dir-0"),
+			);
 		} finally {
 			if (setup) cleanupWorktrees(setup);
 			if (previous === undefined) {
@@ -355,8 +454,95 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 			} else {
 				process.env.PI_SUBAGENTS_WORKTREE_DIR = previous;
 			}
+			cleanupRepo(repoDir, baseDir);
+		}
+	});
+
+	it("rejects empty worktree base directory", () => {
+		const repoDir = createRepo("pi-worktree-empty-base-");
+		try {
+			assert.throws(
+				() => createWorktrees(repoDir, "empty-base", 1, { baseDir: "   " }),
+				/worktree base directory cannot be empty/,
+			);
+		} finally {
 			cleanupRepo(repoDir);
-			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects worktree paths that would land inside the repository checkout", () => {
+		const repoDir = createRepo("pi-worktree-inside-");
+		const repoParent = path.dirname(repoDir);
+		const leakedLeaf = "pi-worktree-inside-0";
+		try {
+			assert.throws(
+				() => createWorktrees(repoDir, "inside", 1, { baseDir: repoParent }),
+				/inside the repository/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "inside", 0, repoParent),
+				/inside the repository/i,
+			);
+
+			const porcelain = git(repoDir, ["worktree", "list", "--porcelain"]);
+			const worktreeLines = porcelain.split("\n").filter((line) => line.startsWith("worktree "));
+			assert.deepEqual(worktreeLines, [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.equal(fs.existsSync(path.join(repoDir, leakedLeaf)), false);
+			assert.equal(fs.existsSync(path.join(repoParent, leakedLeaf)), false);
+		} finally {
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("rejects worktree paths that are direct children of the repository parent", () => {
+		const repoDir = createRepo("pi-worktree-parent-child-");
+		const repoParent = path.dirname(repoDir);
+		const dedicatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-parent-child-root-"));
+		const projectDir = path.join(dedicatedRoot, path.basename(repoDir));
+		const leakedLeaf = path.join(repoParent, "pi-worktree-parent-child-0");
+		try {
+			fs.symlinkSync(repoParent, projectDir, process.platform === "win32" ? "junction" : "dir");
+			assert.throws(
+				() => createWorktrees(repoDir, "parent-child", 1, { baseDir: dedicatedRoot }),
+				/direct child of the repository parent/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "parent-child", 0, dedicatedRoot),
+				/direct child of the repository parent/i,
+			);
+
+			const porcelain = git(repoDir, ["worktree", "list", "--porcelain"]);
+			const worktreeLines = porcelain.split("\n").filter((line) => line.startsWith("worktree "));
+			assert.deepEqual(worktreeLines, [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.equal(fs.existsSync(leakedLeaf), false);
+		} finally {
+			try { fs.rmSync(leakedLeaf, { recursive: true, force: true }); } catch {}
+			fs.rmSync(dedicatedRoot, { recursive: true, force: true });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("does not mkdir inside the checkout when rejecting unsafe locations", () => {
+		const repoDir = createRepo("pi-worktree-no-mkdir-inside-");
+		try {
+			assert.throws(
+				() => createWorktrees(repoDir, "inside-self", 1, { baseDir: repoDir }),
+				/inside the repository/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "inside-self", 0, repoDir),
+				/inside the repository/i,
+			);
+			assert.equal(fs.existsSync(path.join(repoDir, path.basename(repoDir))), false);
+
+			assert.throws(
+				() => createWorktrees(repoDir, "rel-worktrees", 1, { baseDir: "worktrees" }),
+				/inside the repository/i,
+			);
+			assert.equal(fs.existsSync(path.join(repoDir, "worktrees")), false);
+			assert.equal(fs.existsSync(path.join(repoDir, "worktrees", path.basename(repoDir))), false);
+		} finally {
+			cleanupRepo(repoDir);
 		}
 	});
 
