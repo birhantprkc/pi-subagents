@@ -768,6 +768,13 @@ describe("scripted workflow runtime", () => {
 			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
 		});
 		assert.equal(launches[0]?.gate, "npm test");
+		await runWorkflowScript({
+			script: `return runs.run("gated-disabled", { agent: "worker", gate: "npm test", acceptance: false });`,
+			async launch(key, params) { launches.push(params); return { key, ok: true, output: "done", artifactPaths: [] }; },
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+		assert.equal(launches[1]?.gate, "npm test");
+		assert.equal(launches[1]?.acceptance, false);
 		await assert.rejects(
 			runWorkflowScript({
 				script: `return runs.run("invalid", { agent: "worker", gate: "npm test", acceptance: "checked" });`,
@@ -776,6 +783,26 @@ describe("scripted workflow runtime", () => {
 			}),
 			(error: unknown) => error instanceof WorkflowScriptError && /gate cannot be combined with acceptance/.test(error.message),
 		);
+	});
+
+	it("reuses a gated key when acceptance false is explicit", async () => {
+		const launches: string[] = [];
+		const result = await runWorkflowScript({
+			script: `
+				const first = await runs.run("g", { agent: "worker", gate: "npm test" });
+				const second = await runs.run("g", { agent: "worker", gate: "npm test", acceptance: false });
+				return { first: first.key, second: second.key };
+			`,
+			timeoutMs: 2_000,
+			async launch(key) {
+				launches.push(key);
+				return { key, ok: true, output: "ok", artifactPaths: [], results: [] };
+			},
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+
+		assert.deepEqual(result.value, { first: "g", second: "g" });
+		assert.deepEqual(launches, ["g"]);
 	});
 
 	it("rejects retained resume with gate", async () => {

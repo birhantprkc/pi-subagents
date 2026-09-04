@@ -5,6 +5,7 @@ import { Worker } from "node:worker_threads";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import { classifyTaskMutationIntent } from "../runs/shared/task-intent.ts";
+import { describeGateAcceptanceConflict } from "../runs/shared/acceptance.ts";
 import type { AcceptanceRecoveryMetadata, HostStepNodeV1, SingleResult } from "../shared/types.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
 
@@ -72,6 +73,12 @@ function stableRunJson(value) {
   if (Array.isArray(value)) return "[" + value.map(stableRunJson).join(",") + "]";
   if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + stableRunJson(value[key])).join(",") + "}";
   return JSON.stringify(value) ?? "undefined";
+}
+
+function canonicalRunParams(params) {
+  if (params.gate === undefined || params.acceptance !== false) return params;
+  const { acceptance: _acceptance, ...withoutAcceptance } = params;
+  return withoutAcceptance;
 }
 
 function isDirectWorkflowScriptPromiseHandlerCall() {
@@ -445,7 +452,7 @@ function validateLaneSpecs(laneSpecs) {
       validateLaneStageBounds(validationParams, stageLabel);
       validateRunCall(generatedKey, validationParams, stageLabel, validationFingerprints);
       const existingFingerprint = runFingerprints.get(generatedKey);
-      if (existingFingerprint !== undefined && (resume === "previous" || existingFingerprint !== stableRunJson(params))) {
+      if (existingFingerprint !== undefined && (resume === "previous" || existingFingerprint !== stableRunJson(canonicalRunParams(params)))) {
         throw new Error("runs.lanes generated child key '" + generatedKey + "' is already used with incompatible launch params.");
       }
       stages.push({ key: stageKey, generatedKey, resume, params });
@@ -614,6 +621,19 @@ function validateLaneMetadata(value, label, workflowKey) {
   }
 }
 
+function describeGateAcceptanceConflict(gate, acceptance) {
+  const render = (value) => {
+    let encoded;
+    try {
+      encoded = JSON.stringify(value) ?? String(value);
+    } catch {
+      encoded = String(value);
+    }
+    return encoded.length > 120 ? encoded.slice(0, 120) + "..." : encoded;
+  };
+  return " Both fields were present: gate=" + render(gate) + " acceptance=" + render(acceptance) + ".";
+}
+
 function validateRunCall(key, params, label, fingerprints) {
   if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error(label + " has an invalid key.");
   if (hostKeys.has(key)) throw new Error("Workflow key '" + key + "' is already used by runs.host.");
@@ -627,7 +647,7 @@ function validateRunCall(key, params, label, fingerprints) {
   if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) throw new Error(label + " baseRef must be a valid Git ref.");
   validateLaneMetadata(params.lane, label + " lane", key);
   if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) throw new Error(label + " gate must be a non-empty command string.");
-  if (params.gate !== undefined && params.acceptance !== undefined) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify.");
+  if (params.gate !== undefined && params.acceptance !== undefined && params.acceptance !== false) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify." + describeGateAcceptanceConflict(params.gate, params.acceptance));
   if (params.gate !== undefined && params.resume !== undefined) throw new Error(label + " gate is not supported with retained resume.");
   if (params.extensionBindings !== undefined && params.resume !== undefined) throw new Error(label + " extensionBindings is not supported with retained resume; resume uses the original retained child binding.");
   if (params.resume !== undefined && typeof params.resume !== "string") {
@@ -644,7 +664,7 @@ function validateRunCall(key, params, label, fingerprints) {
   if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) throw new Error(label + " resume requires a non-empty task follow-up.");
   validateExtensionBindings(params.extensionBindings, label);
   assertJsonValue(params, label + " params");
-  const fingerprint = stableRunJson(params);
+  const fingerprint = stableRunJson(canonicalRunParams(params));
   const existing = fingerprints.get(key);
   if (existing !== undefined && existing !== fingerprint) throw new Error("Duplicate workflow key '" + key + "' used with incompatible launch params.");
   fingerprints.set(key, fingerprint);
@@ -1370,6 +1390,12 @@ function stableJson(value: unknown): string {
 	return JSON.stringify(value) ?? "undefined";
 }
 
+function canonicalRunParams(params: Record<string, unknown>): Record<string, unknown> {
+	if (params.gate === undefined || params.acceptance !== false) return params;
+	const { acceptance: _acceptance, ...withoutAcceptance } = params;
+	return withoutAcceptance;
+}
+
 function validateKey(value: unknown, owner = "runs.run"): string {
 	if (typeof value !== "string" || !KEY_PATTERN.test(value)) {
 		throw new Error(`${owner} key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.`);
@@ -2082,7 +2108,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					}
 					return result;
 				});
-			const fingerprint = stableJson(params);
+			const fingerprint = stableJson(canonicalRunParams(params));
 			const existing = launches.get(key);
 			if (existing) {
 				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
@@ -2109,8 +2135,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') gate must be a non-empty command string.`)));
 			}
-			if (params.gate !== undefined && params.acceptance !== undefined) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.`)));
+			if (params.gate !== undefined && params.acceptance !== undefined && params.acceptance !== false) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.` + describeGateAcceptanceConflict(params.gate, params.acceptance))));
 			}
 			if (params.gate !== undefined && params.resume !== undefined) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') gate is not supported with retained resume.`)));
