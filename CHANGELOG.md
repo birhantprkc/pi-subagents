@@ -2,24 +2,31 @@
 
 ## [Unreleased]
 
+## [0.65.1] - 2026-09-04
+
+### Highlights
+- Background sessions stay alive until their work and result delivery finish.
+- Custom-provider models and proxy connections work more reliably in background runs.
+- Parallel children keep separate session logs, even with a shared log directory.
+- Worktree cleanup preserves changes until a complete, usable patch has been saved.
+
 ### Changed
-- Simplify retained-route liveness, dispatcher setup, and internal types without changing launch or cleanup contracts.
+- Clarify that switching execution modes after a failed run requires your approval (#1879).
 
 ### Fixed
 - Keep pi-web parent sessions alive while subagent work or completion delivery remains active. Thanks to [@vcing](https://github.com/vcing) for #1857.
-- Clarify that subagent lane infrastructure failures require an explicit owner-approved execution-mode fallback, with exact state and worktree evidence checks before retrying (#1879).
-- Resolve workflow and async-retention process identities lazily without memoizing foreign PIDs. Thanks to [@ducaoya](https://github.com/ducaoya) for #1878.
-- Refresh child session models after loading extension-registered providers and tolerate Pi runtimes without native provider queues. Thanks [@kevinkirkup](https://github.com/kevinkirkup) for #1885.
-- Bound foreground workflow run identities to filesystem-safe segments across progress, child, and receipt records. Thanks [@jstillwa](https://github.com/jstillwa) for #1875.
-- Lazy-load prompt audit optional Pi peers. Thanks [@VladimirGVP](https://github.com/VladimirGVP) for #1860.
-- Use registered provider streams for intent arbitration only when their API matches the model. Thanks [@pwguler](https://github.com/pwguler) for #1874.
-- Key subagent children launched under an explicit `sessionDir` by their run id so concurrent children resolve distinct session files instead of sharing `run-0`. Thanks to [@dat9uy](https://github.com/dat9uy) for #1859 and #1858.
-- Configure proxy-aware HTTP dispatch in detached background runners. Thanks to [@jasonrale](https://github.com/jasonrale) for #1867/#1866.
-- Ignore stale model-not-found exclusions once the active model registry contains that model again. Thanks [@x1prog](https://github.com/x1prog) for #1862.
-- Alias `@earendil-works/pi-agent-core/node` to Pi's exact `./node` export for detached runners. Thanks [@plopezlpz](https://github.com/plopezlpz) for #1871.
-- Alias host peer subpath imports for detached runners. Thanks to [@pwguler](https://github.com/pwguler) for #1880.
-- Initialize Pi's global theme before child extensions access `ctx.ui.theme`, including in detached runners. Thanks [@danielmarbach](https://github.com/danielmarbach) for #1865.
-- Capture managed-worktree handoff patches with machine-safe diff settings and validate them before cleanup. Thanks [@jeanduplessis](https://github.com/jeanduplessis) for #1868.
+- Avoid unnecessary startup delays and preserve active locks when process IDs are reused. Thanks to [@ducaoya](https://github.com/ducaoya) for #1878.
+- Make extension-provided models available before starting child sessions, including on Pi versions without native provider queues. Thanks to [@kevinkirkup](https://github.com/kevinkirkup) for #1885.
+- Handle long or unusual workflow IDs without creating invalid file paths. Thanks to [@jstillwa](https://github.com/jstillwa) for #1875.
+- Avoid startup import errors when optional Pi packages are not installed beside the extension. Thanks to [@VladimirGVP](https://github.com/VladimirGVP) for #1860.
+- Use custom provider streams for task classification only when they match the selected model's API. Thanks to [@pwguler](https://github.com/pwguler) for #1874.
+- Give concurrent children separate session files under an explicit `sessionDir`. Thanks to [@dat9uy](https://github.com/dat9uy) for #1859 and #1858.
+- Honor proxy environment variables in detached background runs. Thanks to [@jasonrale](https://github.com/jasonrale) for #1867 and #1866.
+- Allow previously unavailable models to run once they reappear in the model registry. Thanks to [@x1prog](https://github.com/x1prog) for #1862.
+- Resolve Pi package imports correctly in detached runs, including subpath imports. Thanks to [@plopezlpz](https://github.com/plopezlpz) for #1871 and [@pwguler](https://github.com/pwguler) for #1880.
+- Initialize the theme before child extensions access `ctx.ui.theme`. Thanks to [@danielmarbach](https://github.com/danielmarbach) for #1865.
+- Save complete worktree patches, including binary changes, regardless of Git display settings. Validate them before removing worktrees. Thanks to [@jeanduplessis](https://github.com/jeanduplessis) for #1868.
+- Accept `acceptance: false` alongside `gate`, treating it as omitted.
 
 ## [0.65.0] - 2026-09-04
 
