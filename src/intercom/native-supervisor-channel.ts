@@ -128,34 +128,6 @@ function reasonHeading(reason: SupervisorReason): string {
 	return "Subagent needs a supervisor decision.";
 }
 
-function formatChildMessage(input: {
-	reason: SupervisorReason;
-	message?: string;
-	interview?: unknown;
-	runId: string;
-	agent: string;
-	childIndex: number;
-	childTarget?: string;
-}): string {
-	const lines = [
-		reasonHeading(input.reason),
-		`Run: ${input.runId}`,
-		`Agent: ${input.agent}`,
-		`Child index: ${input.childIndex}`,
-	];
-	if (input.childTarget) lines.push(`Child intercom target: ${input.childTarget}`);
-	lines.push("");
-	if (input.message?.trim()) lines.push(input.message.trim());
-	if (input.reason === "interview_request") {
-		lines.push(
-			"",
-			"Structured response requested. Reply with JSON, optionally fenced in ```json, matching the requested interview shape.",
-		);
-		if (input.interview !== undefined) lines.push(JSON.stringify(input.interview, null, "\t"));
-	}
-	return lines.join("\n").trimEnd();
-}
-
 function parseStructuredReply(message: string): { value?: unknown; error?: string } {
 	const trimmed = message.trim();
 	const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
@@ -210,8 +182,8 @@ async function waitForReply(channelDir: string, requestId: string, deadline: num
 }
 
 async function sendSupervisorRequest(params: ContactSupervisorParams, metadata: ChildSupervisorMetadata, signal?: AbortSignal, toolCallId?: string): Promise<AgentToolResult<Record<string, unknown>>> {
-	if (params.reason !== "progress_update" && !params.message?.trim() && params.reason !== "interview_request") {
-		throw new Error("message is required for supervisor decisions.");
+	if (!params.message?.trim() && params.reason !== "interview_request") {
+		throw new Error("message is required for supervisor decisions and progress updates.");
 	}
 	ensureSupervisorChannelDir(metadata.channelDir);
 	const requestId = randomUUID();
@@ -219,7 +191,7 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, metadata: 
 	const createdAt = Date.now();
 	const replyDeadline = createdAt + askTimeoutMs();
 	const expiresAt = expectsReply ? replyDeadline : undefined;
-	const message = formatChildMessage({ ...metadata, reason: params.reason, message: params.message, interview: params.interview });
+	const message = params.message?.trim() ?? "";
 	const requestToolCallId = typeof toolCallId === "string" && toolCallId.length > 0 ? toolCallId : undefined;
 	const request: SupervisorRequest = {
 		type: "subagent.supervisor.request",
@@ -299,7 +271,7 @@ function parseRequestFile(file: string, channelDir: string): PendingSupervisorRe
 		if (parsed.type !== "subagent.supervisor.request") return undefined;
 		if (typeof parsed.id !== "string" || !parsed.id) return undefined;
 		if (parsed.reason !== "need_decision" && parsed.reason !== "interview_request" && parsed.reason !== "progress_update") return undefined;
-		if (typeof parsed.message !== "string" || !parsed.message) return undefined;
+		if (typeof parsed.message !== "string" || (!parsed.message.trim() && parsed.reason !== "interview_request")) return undefined;
 		if (typeof parsed.runId !== "string" || typeof parsed.agent !== "string" || typeof parsed.childIndex !== "number") return undefined;
 		return {
 			...parsed as SupervisorRequest,
@@ -520,11 +492,24 @@ function formatPendingLine(request: PendingSupervisorRequest): string {
 }
 
 function requestVisibleText(request: PendingSupervisorRequest): string {
-	const lines = [request.message];
-	if (request.expectsReply) {
-		lines.push("", `Reply with: ${supervisorReplyHint(request.id)}`);
+	const lines = [
+		reasonHeading(request.reason),
+		`Run: ${request.runId}`,
+		`Agent: ${request.agent}`,
+		`Child index: ${request.childIndex}`,
+	];
+	if (request.childTarget) lines.push(`Child intercom target: ${request.childTarget}`);
+	lines.push("");
+	if (request.message) lines.push(request.message);
+	if (request.reason === "interview_request") {
+		lines.push(
+			"",
+			"Structured response requested. Reply with JSON, optionally fenced in ```json, matching the requested interview shape.",
+		);
+		if (request.interview !== undefined) lines.push(JSON.stringify(request.interview, null, "\t"));
 	}
-	return lines.join("\n");
+	if (request.expectsReply) lines.push("", `Reply with: ${supervisorReplyHint(request.id)}`);
+	return lines.join("\n").trimEnd();
 }
 
 function writeReply(request: PendingSupervisorRequest, message: string): SupervisorReply {
@@ -759,6 +744,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 					childIndex: request.childIndex,
 					...(request.childTarget ? { childTarget: request.childTarget } : {}),
 					...(request.interview !== undefined ? { interview: request.interview } : {}),
+					requestBody: request.message,
 					...(request.expectsReply ? { replyHint: supervisorReplyHint(request.id) } : {}),
 				},
 			}, { triggerTurn: true });
