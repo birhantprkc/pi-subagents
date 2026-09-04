@@ -779,6 +779,8 @@ export interface RunFanoutRejection extends RunFanoutBudgetSnapshot {
 }
 
 export interface SteeringRecoveryDescriptor {
+	/** Captured response identity authority; absence means no declared aliases on revival. */
+	modelResponseAliases?: Record<string, string[]>;
 	version: 1;
 	launchContractDigest?: string;
 	extensionBindings?: ExtensionBindings;
@@ -2047,6 +2049,7 @@ export interface ForegroundResumeChild {
 	agentContract?: AgentContract;
 	/** Private bounded launch fields needed to preserve the child contract on resume. */
 	resumeContract?: {
+		modelResponseAliases?: Record<string, string[]>;
 		outputSchema?: JsonSchemaObject;
 		agentContract?: AgentContract;
 		acceptance?: AcceptanceInput;
@@ -2411,6 +2414,7 @@ export interface RunSyncOptions {
 	workflowChildPermitLaunch?: WorkflowChildPermitContext;
 	/** Registry models available for heuristic bare-model resolution */
 	availableModels?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
+	modelResponseAliases?: Record<string, string[]>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
 	preferredModelProvider?: string;
 	/** Parent Pi event host used to snapshot runtime-registered MCP servers before child launch. */
@@ -2546,6 +2550,8 @@ export interface ExtensionConfig {
 	asyncWidget?: boolean;
 	/** Configure the process-wide TTL policy for persisted model exclusions. */
 	modelExclusions?: ModelExclusionsConfig;
+	/** Exact provider/model candidates mapped to operator-declared equivalent response IDs. Empty arrays add no accepted IDs. */
+	modelResponseAliases?: Record<string, string[]>;
 	/** Tool description variant registered for the parent-facing subagent tool. Defaults to split metadata. */
 	toolDescriptionMode?: ToolDescriptionMode;
 	/** Inline chat rendering for the subagent tool. Defaults to rich. */

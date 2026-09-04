@@ -3367,6 +3367,37 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("background runs accept captured response aliases for the resolved fallback without rewriting its route", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ jsonl: [], stderr: "429 rate limit exceeded", exitCode: 1 });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Declared async echo accepted", "claude-opus-5")] });
+		const id = `async-response-alias-fallback-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Say hello",
+			acceptance: false,
+			agentConfig: makeAgent("worker", { model: "mock/primary", fallbackModels: ["ias-claude-opus-5:high"] }),
+			ctx: {
+				pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1",
+				modelResponseAliases: { "databricks-bedrock/ias-claude-opus-5": ["claude-opus-5"] },
+			},
+			availableModels: [
+				{ provider: "mock", id: "primary", fullId: "mock/primary" },
+				{ provider: "databricks-bedrock", id: "ias-claude-opus-5", fullId: "databricks-bedrock/ias-claude-opus-5" },
+			],
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.model, "databricks-bedrock/ias-claude-opus-5:high");
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["mock/primary", "databricks-bedrock/ias-claude-opus-5:high"]);
+		assert.equal(payload.results[0]?.modelAttempts?.[1]?.success, true);
+		const args = readMockPiArgs(mockPi, 1);
+		assert.equal(args[args.indexOf("--model") + 1], "databricks-bedrock/ias-claude-opus-5:high");
+		assert.equal(mockPi.callCount(), 2);
+	});
+
 	it("background runs fail when a configured provider-qualified model starts on a different child model", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ jsonl: [events.assistantMessage("wrong async provider", "openai-codex/gpt-5.6-sol")] });
 		const id = `async-model-verification-${Date.now().toString(36)}`;
@@ -3374,7 +3405,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			agent: "worker",
 			task: "Do work",
 			agentConfig: makeAgent("worker", { model: "opencode-go/ox-alpha-free:max" }),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			ctx: {
+				pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1",
+				modelResponseAliases: { "opencode-go/ox-alpha-free": ["declared-echo"] },
+			},
 			availableModels: [
 				{ provider: "opencode-go", id: "ox-alpha-free", fullId: "opencode-go/ox-alpha-free" },
 				{ provider: "openai-codex", id: "gpt-5.6-sol", fullId: "openai-codex/gpt-5.6-sol" },
@@ -5087,6 +5121,56 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(payload.results[0]?.attemptedModels, ["mock/fallback"]);
 		const args = readMockPiArgs(mockPi, 0);
 		assert.equal(args[args.indexOf("--model") + 1], "mock/fallback");
+	});
+
+	it("revival preserves captured response aliases and their absence after config changes", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const route = "databricks-bedrock/ias-claude-opus-5";
+		const agents = [makeAgent("worker", { model: route, completionGuard: false })];
+		const cases = [
+			{ original: { [route]: ["original-echo"] }, current: {}, echo: "original-echo", success: true },
+			{ original: { [route]: ["original-echo"] }, current: { [route]: ["new-echo"] }, echo: "new-echo", success: false },
+			{ original: undefined, current: { [route]: ["new-echo"] }, echo: "new-echo", success: false },
+		];
+		for (const [index, scenario] of cases.entries()) {
+			const parentSessionFile = path.join(tempDir, `alias-parent-${index}.jsonl`);
+			const sessionFile = path.join(tempDir, `alias-child-${index}.jsonl`);
+			const header = JSON.stringify({ type: "session", version: 1, id: `alias-${index}`, cwd: fs.realpathSync(tempDir) });
+			fs.writeFileSync(parentSessionFile, `${header}\n`);
+			fs.writeFileSync(sessionFile, `${header}\n`);
+			const ctx = {
+				...makeMinimalCtx(tempDir),
+				modelRegistry: { getAvailable: () => [{ provider: "databricks-bedrock", id: "ias-claude-opus-5" }] },
+				sessionManager: {
+					getSessionId: () => `alias-session-${index}`,
+					getSessionFile: () => parentSessionFile,
+					getLeafId: () => "leaf",
+					openSession: () => ({ createBranchedSession: () => sessionFile }),
+				},
+			};
+			mockPi.onCall({ jsonl: [events.assistantMessage("Initial work", route)] });
+			const launch = await makeAsyncExecutor(agents, { modelResponseAliases: scenario.original }).execute(
+				`alias-launch-${index}`, { agent: "worker", task: "Do work", async: true, context: "fork", acceptance: false },
+				new AbortController().signal, undefined, ctx,
+			) as AsyncExecutionResult;
+			assert.ok(!launch.isError, launch.content[0]?.text);
+			assert.ok(launch.details.asyncId);
+			assert.equal((await readAsyncPayload(launch.details.asyncId)).success, true);
+
+			// A new executor must recover the durable launch declaration, not its current settings.
+			mockPi.onCall({ jsonl: [events.assistantMessage("Continued work", scenario.echo)] });
+			const resumed = await makeAsyncExecutor(agents, { modelResponseAliases: scenario.current }).execute(
+				`alias-revive-${index}`, { action: "resume", id: launch.details.asyncId, message: "Continue", acceptance: false },
+				new AbortController().signal, undefined, ctx,
+			) as AsyncExecutionResult;
+			assert.ok(!resumed.isError, resumed.content[0]?.text);
+			assert.ok(resumed.details.asyncId);
+			const payload = await readAsyncPayload(resumed.details.asyncId);
+			assert.equal(payload.success, scenario.success, `case ${index}: ${payload.results[0]?.error}`);
+			if (!scenario.success) assert.match(payload.results[0]?.error ?? "", /model_verification_failed/);
+			const args = readMockPiArgs(mockPi, index * 2 + 1);
+			assert.equal(args[args.indexOf("--model") + 1], route);
+			assert.equal(args[args.indexOf("--session") + 1], sessionFile);
+		}
 	});
 
 	it("aligns initial and resumed background forked sessions with an explicit child cwd", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
