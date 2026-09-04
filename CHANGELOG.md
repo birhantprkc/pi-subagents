@@ -2,16 +2,25 @@
 
 ## [Unreleased]
 
-### Changed
-- Refactor subagents to run as native Pi `AgentSession`s instead of spawned `pi` CLI processes (#1844). This removes about 5,800 net lines of process-transport code while keeping persisted status/result/startup schemas stable; foreground children run in the parent process and background children run in the detached runner.
-- Foreground children run in-process and do not load ambient extensions; use background children for agents that need MCP tools or provider-extension models. Background children require Pi from the installed `@earendil-works/pi-coding-agent` package, not a standalone `pi` binary.
-- Rename package subpath `pi-subagents/pi-args` to `pi-subagents/child-tool-plan`; `PI_SUBAGENT_PI_BINARY` now applies only to Herdr project panes and the profile model probe.
-- Replace collapsed async workflow role rollups with a compact lane view while keeping full details available when expanded (#1827).
-- Expose `contact_supervisor` in bundled reviewer and scout tool allowlists without adding mutation tools (#1846).
+## [0.65.0] - 2026-09-04
+
+### Highlights
+- Subagents now run through native Pi sessions instead of spawning separate `pi` processes, making delegation simpler and less fragile.
+- Workflow status is easier to scan with compact lane summaries and clearer supervisor messages.
+- Model selection fails clearly when configured models are unavailable, instead of silently using a provider default.
+- Managed worktrees are safer and more flexible, with validated `baseRef` support and per-project nesting.
+- Background children can use provider-extension models reliably, including dynamically registered models such as router providers.
 
 ### Added
-- Include sanitized excluded model/provider/reason/expiry evidence when no usable subagent candidates remain. Thanks [@AlexKucera](https://github.com/AlexKucera) for #1841.
+- Include sanitized model, provider, reason, and expiry details when no usable subagent model candidates remain. Thanks [@AlexKucera](https://github.com/AlexKucera) for #1841.
 - Allow managed worktrees to start from a validated `baseRef` instead of always using `HEAD`. Thanks [@jaudiger](https://github.com/jaudiger) for #1842.
+
+### Changed
+- Run subagents as native Pi `AgentSession`s instead of spawned `pi` CLI processes (#1844). Foreground children run in the parent process, and background children run in the detached runner.
+- Foreground children no longer load ambient extensions. Use background children for agents that need MCP tools or provider-extension models. Background children require Pi from the installed `@earendil-works/pi-coding-agent` package, not a standalone `pi` binary.
+- Rename package subpath `pi-subagents/pi-args` to `pi-subagents/child-tool-plan`; `PI_SUBAGENT_PI_BINARY` now applies only to Herdr project panes and the profile model probe.
+- Replace collapsed async workflow role summaries with a compact lane view while keeping full details available when expanded (#1827).
+- Add `contact_supervisor` to the bundled reviewer and scout tool allowlists without adding mutation tools (#1846).
 
 ### Fixed
 - Drop only malformed persisted model-exclusion entries and rewrite the cleaned cache.
