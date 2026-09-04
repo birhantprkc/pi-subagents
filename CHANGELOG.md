@@ -2,17 +2,11 @@
 
 ## [Unreleased]
 
-### Fixed
-- Accept explicitly configured response model aliases for exact provider-qualified child launch routes without changing requests or default verification. Thanks to [@drudko-ias](https://github.com/drudko-ias) for #1897.
-- Hide the idle `Async runs 0/∞` Fleet summary while preserving finite and occupied capacity meters. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1892.
-- Supply Pi 0.85.0’s missing server dependency for background children, including extensions importing the public SDK, while preserving host-provided packages.
-- Avoid repeating structured metadata and reply instructions in native supervisor request cards. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1893.
-- Fail foreground children before provider work when required tools are unavailable, honor omitted workflow child async defaults while awaiting completion, and avoid duplicate workflow failure diagnostics. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1891.
-
 ## [0.65.1] - 2026-09-04
 
 ### Highlights
 - Background sessions stay alive until their work and result delivery finish.
+- Background runs work on Pi 0.85.0 without missing-package errors.
 - Custom-provider models and proxy connections work more reliably in background runs.
 - Parallel children keep separate session logs, even with a shared log directory.
 - Worktree cleanup preserves changes until a complete, usable patch has been saved.
@@ -21,6 +15,11 @@
 - Clarify that switching execution modes after a failed run requires your approval (#1879).
 
 ### Fixed
+- Accept configured model aliases returned by gateways without changing the requested model. Thanks to [@drudko-ias](https://github.com/drudko-ias) for #1897.
+- Hide the empty, unlimited async capacity summary in Fleet. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1892.
+- Fix missing-server import errors in Pi 0.85.0 background runs, including runs that load extensions.
+- Remove repeated metadata and reply instructions from supervisor request cards. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1893.
+- Stop foreground runs before contacting a provider when required tools are missing. Respect workflow async defaults and show each failure once. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1891.
 - Keep pi-web parent sessions alive while subagent work or completion delivery remains active. Thanks to [@vcing](https://github.com/vcing) for #1857.
 - Avoid unnecessary startup delays and preserve active locks when process IDs are reused. Thanks to [@ducaoya](https://github.com/ducaoya) for #1878.
 - Make extension-provided models available before starting child sessions, including on Pi versions without native provider queues. Thanks to [@kevinkirkup](https://github.com/kevinkirkup) for #1885.
