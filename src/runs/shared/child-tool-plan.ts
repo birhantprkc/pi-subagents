@@ -22,6 +22,7 @@ import {
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 import { getAgentDir } from "../../shared/utils.ts";
 import type { PermissionRules } from "./permissions.ts";
+import { snapshotRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import {
 	capabilityCeilingAgentRestrictionSources,
 	intersectSubagentCapabilityCeilings,
@@ -167,6 +168,7 @@ export interface ResolvePiLaunchToolPlanInput {
 	allowNestedSubagents?: boolean;
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];
 	cwd?: string;
 	requireReadTool?: boolean;
@@ -213,6 +215,7 @@ export interface PiLaunchToolPlan {
 	fanoutAuthorized: boolean;
 	runtimeExtensions: string[];
 	configuredExtensions: string[];
+	requiredExtensions: RequiredChildExtensionSnapshot;
 	extensionArgs: string[];
 	disableAmbientExtensions: boolean;
 	capabilityAudit?: SubagentCapabilityAudit;
@@ -257,6 +260,7 @@ export function projectLaunchResolvedChildExtensions(
 		PiLaunchToolPlan,
 		| "runtimeExtensions"
 		| "configuredExtensions"
+		| "requiredExtensions"
 		| "extensionArgs"
 		| "disableAmbientExtensions"
 	>,
@@ -270,10 +274,12 @@ export function projectLaunchResolvedChildExtensions(
 		disableAmbientExtensions: toolPlan.disableAmbientExtensions,
 		runtime: runtime.ids,
 		configured: configured.ids,
+		required: toolPlan.requiredExtensions.map(({ id }) => id),
 		effective: effective.ids,
 		omitted: {
 			runtime: runtime.omitted,
 			configured: configured.omitted,
+			required: 0,
 			effective: effective.omitted,
 		},
 	};
@@ -368,6 +374,10 @@ export function resolvePiLaunchToolPlan(
 		input.capabilityCeiling,
 		input.inheritedCapabilityCeiling,
 	);
+	const requiredExtensions = snapshotRequiredChildExtensions(input.requiredExtensions ?? []);
+	if (requiredExtensions.length > 0 && capabilityCeiling?.denyExtensions) {
+		throw new Error(`Capability ceiling from ${capabilityCeiling.sources.join(", ") || "unknown source"} denies extensions but this host requires: ${requiredExtensions.map(({ id }) => id).join(", ")}.`);
+	}
 	const allowedToolSet =
 		capabilityCeiling?.allowedTools === undefined
 			? undefined
@@ -510,7 +520,7 @@ export function resolvePiLaunchToolPlan(
 				...(input.extensions ?? []),
 				...(input.subagentOnlyExtensions ?? []),
 			];
-	const extensionArgs = disableAmbientExtensions
+	const ordinaryExtensionArgs = disableAmbientExtensions
 		? [...new Set([...runtimeExtensions, ...configuredExtensions])]
 		: [
 				...new Set([
@@ -519,6 +529,8 @@ export function resolvePiLaunchToolPlan(
 					...(input.subagentOnlyExtensions ?? []),
 				]),
 			];
+	// Host-required paths have final precedence and cannot be removed by agent defaults or overrides.
+	const extensionArgs = [...new Set([...ordinaryExtensionArgs, ...requiredExtensions.map(({ path }) => path)])];
 	const requestedToolNames =
 		input.tools !== undefined
 			? [
@@ -610,6 +622,7 @@ export function resolvePiLaunchToolPlan(
 		fanoutAuthorized,
 		runtimeExtensions,
 		configuredExtensions,
+		requiredExtensions,
 		extensionArgs,
 		disableAmbientExtensions,
 		warnings,

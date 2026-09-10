@@ -58,6 +58,7 @@ function compactChild(child: ForegroundResumeChild): ForegroundResumeChild {
 		...(child.resumeContract ? { resumeContract: child.resumeContract } : {}),
 		...(child.launchContractDigest ? { launchContractDigest: child.launchContractDigest } : {}),
 		...(child.extensionBindings ? { extensionBindings: child.extensionBindings } : {}),
+		...(child.requiredExtensions ? { requiredExtensions: child.requiredExtensions } : {}),
 		...(child.capabilityCeiling ? { capabilityCeiling: child.capabilityCeiling } : {}),
 		...(child.updatedAt !== undefined ? { updatedAt: child.updatedAt } : {}),
 	};

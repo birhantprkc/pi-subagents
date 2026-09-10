@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, emitProcessTerminalEvent, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
 	name,
@@ -202,9 +203,11 @@ describe("async runner execution", () => {
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 4, block: ["read"] });
 	});
 
-	it("attaches external runner config and rejects unsupported Pi-only overrides", () => {
+	it("attaches external runner config and rejects unsupported Pi-only overrides", (t) => {
 		const external = agent("external");
 		external.runner = { type: "external-cli", command: process.execPath, args: ["fake.mjs"] };
+		const registration = registerRequiredChildExtensions({ sessionId: ctx.currentSessionId, extensions: [{ id: "native-only", path: import.meta.filename }] });
+		t.after(registration.dispose);
 		const built = buildAsyncRunnerSteps("external-run", {
 			chain: [{ agent: "external", task: "review" }],
 			agents: [external],
@@ -215,6 +218,7 @@ describe("async runner execution", () => {
 		assert.ok("steps" in built);
 		assert.deepEqual(built.steps[0]?.runner, external.runner);
 		assert.equal(built.steps[0]?.model, undefined);
+		assert.equal(built.steps[0]?.requiredExtensions, undefined);
 
 		const rejected = buildAsyncRunnerSteps("external-rejected", {
 			chain: [{ agent: "external", task: "review", model: "provider/model" }],

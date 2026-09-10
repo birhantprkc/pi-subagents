@@ -399,6 +399,7 @@ async function runSingleAttempt(
 	let onWatchdogStatus: ((event: ChildWatchdogStatusEvent) => void) | undefined;
 	const launch = buildInProcessChildLaunch({
 		extensionBindings: options.extensionBindings,
+		requiredExtensions: options.requiredExtensions,
 		sessionEnabled: shared.sessionEnabled,
 		sessionDir: options.sessionDir,
 		sessionFile: options.sessionFile,

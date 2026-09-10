@@ -16,6 +16,7 @@ import type { GlobalMissionIndexRecord, MissionRecord, MissionStoreConfig } from
 import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 import type { WorkflowChildPermitContext } from "./workflow-child-permit.ts";
 import type { WatchdogWarningDetails } from "../watchdog/types.ts";
+import type { RequiredChildExtensionSnapshot } from "./required-child-extensions.ts";
 
 // ============================================================================
 // Basic Types
@@ -800,6 +801,7 @@ export interface SteeringRecoveryDescriptor {
 	version: 1;
 	launchContractDigest?: string;
 	extensionBindings?: ExtensionBindings;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	runFanoutBudget: RunFanoutBudgetDescriptor;
 	sourceRunId: string;
 	agentContract?: AgentContract;
@@ -1187,10 +1189,13 @@ export interface LaunchResolvedChildExtensions {
 	disableAmbientExtensions: boolean;
 	runtime: string[];
 	configured: string[];
+	/** Bounded host-supplied identities; paths are intentionally not exposed. */
+	required: string[];
 	effective: string[];
 	omitted: {
 		runtime: number;
 		configured: number;
+		required: number;
 		effective: number;
 	};
 }
@@ -2079,6 +2084,7 @@ export interface ForegroundResumeChild {
 	launchContractDigest?: string;
 	/** Private retained launch authority. Never project into status or result output. */
 	extensionBindings?: ExtensionBindings;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	launchResolvedExtensions?: LaunchResolvedChildExtensions;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	execution?: ExecutionProjection;
@@ -2431,6 +2437,7 @@ export interface RunSyncOptions {
 	/** Override the agent's default thinking level for this run */
 	thinkingOverride?: AgentConfig["thinking"];
 	thinkingCeiling?: ThinkingLevel;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	extensionBindings?: ExtensionBindings;
 	/** Package-internal one-use authorization for one foreground workflow child. */
 	workflowChildPermitLaunch?: WorkflowChildPermitContext;
