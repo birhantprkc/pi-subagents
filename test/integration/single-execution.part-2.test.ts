@@ -66,6 +66,7 @@ import { createResultWatcher } from "../../src/runs/background/result-watcher.ts
 import { clearExclusions, recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import { createWorkflowChildPermit, workflowChildPermitConsumed } from "../../src/shared/workflow-child-permit.ts";
 import { toSubagentDelegationExecutionParams } from "../../src/slash/delegation-adapters.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installSingleExecutionHooks();
@@ -3551,6 +3552,24 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.deepEqual(result.runtimeAcknowledgedExtensions, { version: 1, source: "child-runtime", ids: ["ext.ok"], omitted: 0 });
 		assert.deepEqual(metadata.runtimeAcknowledgedExtensions, result.runtimeAcknowledgedExtensions);
 		assert.ok(!JSON.stringify(result.launchResolvedExtensions).includes(tempDir), "projection should not expose raw extension paths");
+	});
+
+	it("resolves foreground required extensions by Pi session ID rather than session file", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async (t) => {
+		mockPi.onCall({ output: "required extension loaded" });
+		const extensionPath = path.join(tempDir, "foreground-required.mjs");
+		fs.writeFileSync(extensionPath, "export default function () {}\n");
+		const parentPiSessionId = "foreground-pi-session";
+		const registration = registerRequiredChildExtensions({ sessionId: parentPiSessionId, extensions: [{ id: "foreground-required", path: extensionPath }] });
+		t.after(registration.dispose);
+		const ctx = makeMinimalCtx(tempDir);
+		ctx.sessionManager.getSessionId = () => parentPiSessionId;
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "sessions", "different-file-identity.jsonl");
+		const result = await makeExecutor([makeAgent("echo")]).execute("foreground-required", { agent: "echo", task: "Load host policy" }, new AbortController().signal, undefined, ctx);
+
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(readCall().launch?.extensionPaths, [fs.realpathSync(extensionPath)]);
+		assert.deepEqual(result.details?.results?.[0]?.launchResolvedExtensions?.required, ["foreground-required"]);
+		assert.equal(JSON.stringify(result.details?.results?.[0]?.launchResolvedExtensions).includes(extensionPath), false);
 	});
 
 	it("routes foreground artifacts to the configured session directory", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

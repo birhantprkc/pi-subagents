@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { registerSubagentCapabilityCeiling, resolveSubagentCapabilityCeiling } from "../../src/api/capability-ceiling.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { resolveSubagentLaunchContract, SUBAGENT_LAUNCH_CONTRACT_VERSION } from "../../src/api/preflight.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
@@ -73,6 +74,22 @@ describe("public launch contract preflight", () => {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("exposes required host IDs without exposing their private paths", async () => {
+		const cwd = path.join(tempDir, "repo");
+		fs.mkdirSync(path.join(cwd, ".pi", "agents"), { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "required.md"), "---\nname: required\ndescription: Required extension fixture\n---\nFixture.\n");
+		const extensionPath = path.join(tempDir, "required-provider.mjs");
+		fs.writeFileSync(extensionPath, "export default () => {};\n");
+		const registration = registerRequiredChildExtensions({ sessionId: "preflight-required", extensions: [{ id: "safe-provider", path: extensionPath }] });
+		try {
+			const result = await resolveSubagentLaunchContract({ agent: "required", cwd, parentSessionId: "preflight-required" });
+			assert.equal(result.ok, true);
+			if (!result.ok) return;
+			assert.deepEqual(result.contract.tools.requiredExtensionIds, ["safe-provider"]);
+			assert.equal(result.contract.tools.extensionArgs.includes(fs.realpathSync(extensionPath)), false);
+		} finally { registration.dispose(); }
 	});
 
 	it("resolves an ordinary single-agent contract without creating launch directories", async () => {

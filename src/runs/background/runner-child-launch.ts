@@ -50,6 +50,7 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 		allowNestedSubagents: step.allowNestedSubagents,
 		extensions: step.extensions,
 		subagentOnlyExtensions: step.subagentOnlyExtensions,
+		requiredExtensions: step.requiredExtensions,
 		fast: step.fast,
 		modelCandidates: step.modelCandidates,
 		systemPrompt: acceptancePrompt ? `${step.systemPrompt ?? ""}\n${acceptancePrompt}` : step.systemPrompt ?? "",

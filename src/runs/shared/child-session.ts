@@ -14,6 +14,7 @@ import { getAgentDir } from "../../shared/utils.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { prepareReadonlySessionEvidence } from "./readonly-session-evidence.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
+import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 // Private runtime authority for host continuation planning; injected factories have none.
 const readonlyModels = new WeakMap<ChildSession, { current: ModelInfo; resolve(reference: string): ModelInfo | undefined; requestBytes: number }>();
@@ -62,6 +63,8 @@ export interface ChildSessionLaunch {
 	excludeTools?: string[];
 	/** Extension files loaded for this child in addition to the inline hooks. */
 	extensionPaths: string[];
+	/** Canonical required paths and safe evidence identities for fail-closed loading. */
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	/**
 	 * Discover the ambient extensions (agent dir, project, settings) the way a
 	 * `pi` process would. False loads only `extensionPaths` and `hooks`.
@@ -173,7 +176,7 @@ function applyProcessEnv(values: Record<string, string | undefined> | undefined)
 	}
 }
 
-async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined): Promise<void> {
+async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined, requiredPaths: ReadonlySet<string>): Promise<void> {
 	if (!("getExtensions" in loader) || typeof loader.getExtensions !== "function") return;
 	const { runtime } = loader.getExtensions();
 	let registered = false;
@@ -183,6 +186,7 @@ async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAge
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_provider", error });
+			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(runtime.pendingProviderRegistrations)) runtime.pendingProviderRegistrations = [];
@@ -192,6 +196,7 @@ async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAge
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_provider", error });
+			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(runtime.pendingNativeProviderRegistrations)) runtime.pendingNativeProviderRegistrations = [];
@@ -245,11 +250,15 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
 			});
 			const open = async () => {
+				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
 				applyProcessEnv(launch.processEnv);
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				observeReadonly?.loadingHooks(true);
 				try { await loader.reload(); } finally { observeReadonly?.loadingHooks(false); }
-				await flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError);
+				const loadErrors = requiredPaths.size > 0
+					? loader.getExtensions().errors.filter(({ path }) => requiredPaths.has(path)) : [];
+				if (loadErrors.length > 0) throw new Error(`Required child extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
+				await flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError, requiredPaths);
 				// No await between receipt validation and the SDK's permissive file open.
 				observeReadonly?.beforeOpen();
 				const sessionManager = launch.storage.kind === "file"

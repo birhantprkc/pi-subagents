@@ -83,6 +83,7 @@ import { resolveLaunchBinding } from "../../shared/launch-contract.ts";
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
+import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot() ?? resolveInstalledPiPackageRoot();
@@ -223,6 +224,7 @@ interface AsyncSingleParams {
 	agentConfig: AgentConfig;
 	/** Agent contract before per-run bridge injection, used only for recovery persistence. */
 	recoveryAgentConfig?: AgentConfig;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	ctx: AsyncExecutionContext;
 	cwd?: string;
 	requestedCwd?: string;
@@ -966,12 +968,14 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		if (launchRuleError) throw new AsyncStartValidationError(launchRuleError);
 		const fast = s.fast ?? params.fast ?? a.fast;
 		const hostAvailableBuiltins = getHostBuiltinToolNames(ctx.pi);
+		const requiredExtensions = externalRunner ? [] : ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
 			excludeTools: a.excludeTools,
 			allowNestedSubagents: a.allowNestedSubagents,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
+			requiredExtensions,
 			mcpDirectTools: a.mcpDirectTools,
 			cwd: stepCwd,
 			requireReadTool: Boolean(resolvedSkills.length),
@@ -1035,6 +1039,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			allowNestedSubagents: a.allowNestedSubagents,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
+			...(!externalRunner ? { requiredExtensions } : {}),
 			mcpDirectTools: a.mcpDirectTools,
 			mutationTools: a.mutationTools,
 			completionGuard: a.completionGuard,
@@ -1755,12 +1760,14 @@ export function executeAsyncSingle(
 		}
 	}
 	const hostAvailableBuiltins = getHostBuiltinToolNames(ctx.pi);
+	const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
 		excludeTools: agentConfig.excludeTools,
 		allowNestedSubagents: agentConfig.allowNestedSubagents,
 		extensions: agentConfig.extensions,
 		subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
+		requiredExtensions,
 		mcpDirectTools: agentConfig.mcpDirectTools,
 		cwd: runnerCwd,
 		requireReadTool: Boolean(resolvedSkills.length),
@@ -1822,6 +1829,7 @@ export function executeAsyncSingle(
 		...(lane ? { lane } : {}),
 		launchContractDigest,
 		...(extensionBindings ? { extensionBindings } : {}),
+		...(requiredExtensions.length > 0 ? { requiredExtensions } : {}),
 		runFanoutBudget,
 		sourceRunId: id,
 		...(params.agentContract ? { agentContract: params.agentContract } : {}),
@@ -1912,6 +1920,7 @@ export function executeAsyncSingle(
 						allowNestedSubagents: agentConfig.allowNestedSubagents,
 						extensions: agentConfig.extensions,
 						subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
+						...(!externalRunner ? { requiredExtensions } : {}),
 						mcpDirectTools: agentConfig.mcpDirectTools,
 						mutationTools: agentConfig.mutationTools,
 						completionGuard: agentConfig.completionGuard,

@@ -26,6 +26,7 @@ import { processTerminalCandidatePath, processTerminalPath } from "../runs/backg
 import { resultFilePath } from "../runs/background/result-files.ts";
 import { nestedResultsPath } from "../runs/shared/nested-events.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../runs/shared/extension-bindings.ts";
+import { resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
 
 // v3: the contract reports the resolved Intercom bridge state and binds its
 // prompt and tools into launchContractDigest, matching execution (#2127).
@@ -77,6 +78,8 @@ export interface SubagentLaunchContractInput {
 	artifacts?: boolean;
 	artifactDir?: ArtifactDirPreference;
 	parentSessionFile?: string | null;
+	/** Parent session whose host-required child extension snapshot is preflighted. */
+	parentSessionId?: string;
 	/** Current parent leaf required before an implicit `defaultContext: fork` stays `fork`. */
 	parentLeafId?: string | null;
 	sessionRoot?: string;
@@ -144,6 +147,7 @@ export interface SubagentLaunchContractTools {
 	toolExtensionPaths: string[];
 	runtimeExtensions: string[];
 	configuredExtensions: string[];
+	requiredExtensionIds: string[];
 	extensionArgs: string[];
 	disableAmbientExtensions: boolean;
 	fanoutAuthorized: boolean;
@@ -398,6 +402,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	let toolPlan: PiLaunchToolPlan;
 	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions);
 	const fast = input.fast ?? agent.fast;
+	const requiredExtensions = externalRunner ? [] : resolveRequiredChildExtensions(input.parentSessionId);
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: agent.tools,
@@ -405,6 +410,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			allowNestedSubagents: agent.allowNestedSubagents,
 			extensions: agent.extensions,
 			subagentOnlyExtensions: agent.subagentOnlyExtensions,
+			requiredExtensions,
 			mcpDirectTools: agent.mcpDirectTools,
 			cwd: effectiveCwd,
 			requireReadTool: resolvedSkills.resolved.length > 0,
@@ -501,7 +507,9 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			toolExtensionPaths: toolPlan.toolExtensionPaths,
 			runtimeExtensions: toolPlan.runtimeExtensions,
 			configuredExtensions: toolPlan.configuredExtensions,
-			extensionArgs: toolPlan.extensionArgs,
+			requiredExtensionIds: toolPlan.requiredExtensions.map(({ id }) => id),
+			// Required paths are private launch authority; preflight exposes their safe IDs above.
+			extensionArgs: toolPlan.extensionArgs.filter((extensionPath) => !requiredExtensions.some(({ path }) => path === extensionPath)),
 			disableAmbientExtensions: toolPlan.disableAmbientExtensions,
 			fanoutAuthorized: toolPlan.fanoutAuthorized,
 			...(toolPlan.capabilityCeiling ? { capabilityCeiling: toolPlan.capabilityCeiling } : {}),

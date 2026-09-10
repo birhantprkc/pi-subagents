@@ -818,6 +818,7 @@ export async function runSingleStepInner(
 			structuredOutput: Boolean(effectiveStructuredOutput),
 			capabilityCeiling: step.capabilityCeiling ?? ctx.capabilityCeiling,
 			inheritedCapabilityCeiling: ctx.inheritedChildRuntime?.capabilityCeiling,
+			requiredExtensions: step.requiredExtensions ?? ctx.inheritedChildRuntime?.requiredExtensions,
 			permissionRules: step.permissionRules,
 			hostAvailableBuiltins: ctx.hostAvailableBuiltins,
 		}));
@@ -1157,6 +1158,7 @@ export async function runSingleStepInner(
 				structuredOutput: Boolean(effectiveStructuredOutput),
 				capabilityCeiling: step.capabilityCeiling ?? ctx.capabilityCeiling,
 				inheritedCapabilityCeiling: ctx.inheritedChildRuntime?.capabilityCeiling,
+				requiredExtensions: step.requiredExtensions ?? ctx.inheritedChildRuntime?.requiredExtensions,
 				permissionRules: step.permissionRules,
 				hostAvailableBuiltins: ctx.hostAvailableBuiltins,
 			}));

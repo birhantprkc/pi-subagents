@@ -68,6 +68,7 @@ import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { isAgentContract } from "../shared/agent-contract.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../shared/extension-bindings.ts";
+import { resolveRequiredChildExtensions } from "../../shared/required-child-extensions.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, outputPathMappingFromTask, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { assertJsonSchemaObject, cleanupStructuredOutputRuntime, createStructuredOutputRuntime } from "../shared/structured-output.ts";
 import { compactForegroundDetails, getSingleResultOutput, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage, toAgentToolUsage } from "../../shared/utils.ts";
@@ -748,7 +749,7 @@ function foregroundChildActivityFromProgress(progress: SingleResult["progress"] 
 	};
 }
 
-function rememberForegroundRun(state: SubagentState, input: { modelResponseAliases?: Record<string, string[]>; runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId: string | null; results: SingleResult[]; params: SubagentParamsLike; effectiveOutput?: string | boolean; effectiveOutputMode: OutputMode; extensionBindings?: ExtensionBindings }): void {
+function rememberForegroundRun(state: SubagentState, input: { modelResponseAliases?: Record<string, string[]>; runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId: string | null; results: SingleResult[]; params: SubagentParamsLike; effectiveOutput?: string | boolean; effectiveOutputMode: OutputMode; extensionBindings?: ExtensionBindings; requiredExtensions?: SteeringRecoveryDescriptor["requiredExtensions"] }): void {
 	state.foregroundRuns ??= new Map();
 	const previous = state.foregroundRuns.get(input.runId);
 	const updatedAt = Date.now();
@@ -801,6 +802,7 @@ function rememberForegroundRun(state: SubagentState, input: { modelResponseAlias
 				...(Object.keys(resumeContract).length ? { resumeContract } : {}),
 				...(result.launchContractDigest ? { launchContractDigest: result.launchContractDigest } : {}),
 				...(input.extensionBindings ? { extensionBindings: input.extensionBindings } : {}),
+				...(input.requiredExtensions?.length ? { requiredExtensions: input.requiredExtensions } : {}),
 				...(result.launchResolvedExtensions ? { launchResolvedExtensions: result.launchResolvedExtensions } : {}),
 				...(result.runtimeAcknowledgedExtensions ? { runtimeAcknowledgedExtensions: result.runtimeAcknowledgedExtensions } : {}),
 				...(result.capabilityCeiling ? { capabilityCeiling: result.capabilityCeiling } : {}),
@@ -952,6 +954,7 @@ function resolveForegroundResumeTarget(params: SubagentParamsLike, state: Subage
 		...(child.launchContractDigest ? { launchContractDigest: child.launchContractDigest } : {}),
 		...(child.resumeContract ? { resumeContract: child.resumeContract } : {}),
 		...(child.extensionBindings ? { extensionBindings: normalizeExtensionBindings(child.extensionBindings)!.value } : {}),
+		...(child.requiredExtensions ? { requiredExtensions: child.requiredExtensions } : {}),
 		...(child.capabilityCeiling ? { capabilityCeiling: child.capabilityCeiling } : {}),
 	};
 }
@@ -1995,6 +1998,7 @@ async function resumeAsyncRun(input: {
 			worktreeSetupHookTimeoutMs: input.deps.config.worktreeSetupHookTimeoutMs,
 			worktreeBaseDir: input.deps.config.worktreeBaseDir,
 			baseRef: input.params.baseRef ?? target.recoveryDescriptor?.baseRef,
+			...(recoveryDescriptor?.requiredExtensions ? { requiredExtensions: recoveryDescriptor.requiredExtensions } : {}),
 			worktreeProvider: input.deps.config.worktreeProvider,
 			worktreeBranchPrefix: input.deps.config.worktreeBranchPrefix,
 			controlConfig: resolveControlConfig(input.deps.config.control, input.params.control),
@@ -2109,6 +2113,7 @@ async function resumeAsyncRun(input: {
 		thinkingOverride: recoveryDescriptor?.thinking ?? target.thinking,
 		thinkingCeiling: recoveryDescriptor?.thinkingCeiling ?? ("thinkingCeiling" in target ? target.thinkingCeiling : undefined),
 		extensionBindings: recoveryDescriptor?.extensionBindings ?? ("extensionBindings" in target ? target.extensionBindings : undefined),
+		requiredExtensions: recoveryDescriptor?.requiredExtensions ?? (target as { requiredExtensions?: SteeringRecoveryDescriptor["requiredExtensions"] }).requiredExtensions,
 		outputBaseDir: resolveSingleRunOutputBaseDir(input.deps, artifactsDir, runId),
 		maxSubagentDepth: recoveryDescriptor?.maxSubagentDepth ?? resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 		waitToolEnabled: input.deps.waitToolEnabled,
@@ -3886,6 +3891,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		: undefined;
 
 	const deadlineAt = data.deadlineAt ?? (data.timeoutMs !== undefined ? Date.now() + data.timeoutMs : undefined);
+	const requiredExtensions = deps.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(data.parentPiSessionId);
 	let r: Awaited<ReturnType<typeof runSync>> | undefined;
 	let resolveDetachedWorkflowChild: ((result: Awaited<ReturnType<typeof runSync>>) => void) | undefined;
 	const detachedWorkflowChild = params.workflowAwaitDetached === true
@@ -3897,6 +3903,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			runtimeSnapshotHost: deps.pi,
 			hostAvailableBuiltins: getHostBuiltinToolNames(deps.pi),
 			parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+			requiredExtensions,
 			llmIntentArbiter: createTaskMutationArbiter({ model: ctx.model, modelRegistry: ctx.modelRegistry, sessionId: ctx.sessionManager.getSessionId() }),
 			childRuntime: deps.childRuntime,
 			onChildSession: (controls) => { childSessionControls = controls; },
@@ -4057,7 +4064,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		usageBudget: usageBudgetState(data.usageBudget, totalCost),
 		...(worktreeHandoff?.reference ? { parallelHandoff: worktreeHandoff.reference } : {}),
 	}));
-	rememberForegroundRun(deps.state, { modelResponseAliases, runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, results: details.results, params, effectiveOutput, effectiveOutputMode, extensionBindings: params.extensionBindings });
+	rememberForegroundRun(deps.state, { modelResponseAliases, runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, results: details.results, params, effectiveOutput, effectiveOutputMode, extensionBindings: params.extensionBindings, requiredExtensions });
 
 	const suppressRoutineResultIntercom = shouldSuppressRoutineResultIntercom({ suppressRoutineResultIntercom: params.suppressRoutineResultIntercom, results: [r] });
 	if (!r.detached && !r.interrupted && !suppressRoutineResultIntercom) {

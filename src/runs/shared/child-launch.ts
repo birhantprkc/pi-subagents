@@ -35,6 +35,7 @@ import { createCapturedChildHooks, withChildSessionErrorReporting } from "./chil
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
 import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
+import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
 export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
@@ -44,7 +45,7 @@ export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
  * launches inherits. Serialized into the background runner config; the
  * foreground path passes the executor's full `ChildRuntimeConfig`.
  */
-export type InheritedChildRuntime = Pick<ChildRuntimeConfig, "depth" | "maxDepth" | "nestedRoute" | "nestedParent" | "capabilityCeiling" | "thinkingCeiling" | "runFanoutBudget">;
+export type InheritedChildRuntime = Pick<ChildRuntimeConfig, "depth" | "maxDepth" | "nestedRoute" | "nestedParent" | "capabilityCeiling" | "thinkingCeiling" | "runFanoutBudget" | "requiredExtensions">;
 
 export function inheritedChildRuntime(config: ChildRuntimeConfig | undefined): InheritedChildRuntime | undefined {
 	if (!config) return undefined;
@@ -56,6 +57,7 @@ export function inheritedChildRuntime(config: ChildRuntimeConfig | undefined): I
 		...(config.capabilityCeiling ? { capabilityCeiling: config.capabilityCeiling } : {}),
 		...(config.thinkingCeiling ? { thinkingCeiling: config.thinkingCeiling } : {}),
 		...(config.runFanoutBudget ? { runFanoutBudget: config.runFanoutBudget } : {}),
+		...(config.requiredExtensions ? { requiredExtensions: config.requiredExtensions } : {}),
 	};
 }
 
@@ -76,6 +78,8 @@ export interface BuildInProcessChildLaunchInput {
 	excludeTools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
+	/** Serialized launch snapshot; omitted only for a top-level parent-process lookup. */
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
 	extensionBindings?: ExtensionBindings;
@@ -182,12 +186,14 @@ function childStorage(input: BuildInProcessChildLaunchInput): ChildSessionStorag
 }
 
 export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput): InProcessChildLaunch {
+	const requiredExtensions = input.requiredExtensions ?? input.inherited?.requiredExtensions ?? resolveRequiredChildExtensions(input.parentSessionId);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: input.tools,
 		excludeTools: input.excludeTools,
 		allowNestedSubagents: input.allowNestedSubagents,
 		extensions: input.extensions,
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
+		requiredExtensions,
 		mcpDirectTools: input.mcpDirectTools,
 		cwd: input.cwd,
 		requireReadTool: input.requireReadTool,
@@ -248,6 +254,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		maxDepth: childDepth.maxDepth,
 		...(toolPlan.capabilityCeiling ? { capabilityCeiling: toolPlan.capabilityCeiling } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
+		...(toolPlan.requiredExtensions.length > 0 ? { requiredExtensions: toolPlan.requiredExtensions } : {}),
 		inheritProjectContext: input.inheritProjectContext,
 		inheritGlobalContext: input.inheritGlobalContext,
 		inheritSkills: input.inheritSkills,
@@ -289,6 +296,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		configuredExtensions: toolPlan.configuredExtensions,
 		extensionArgs: toolPlan.extensionArgs,
 		disableAmbientExtensions: !ambientExtensions,
+		requiredExtensions: toolPlan.requiredExtensions,
 	});
 	const taggedPrompt = input.systemPrompt !== undefined && input.systemPrompt !== null
 		? `<active_agent name="${escapeXmlAttr(input.childAgentName)}"/>\n\n${input.systemPrompt}`
@@ -300,6 +308,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(toolPlan.explicitToolAllowlist ? { tools: toolPlan.effectiveToolAllowlist } : {}),
 		...(!toolPlan.explicitToolAllowlist && toolPlan.excludeTools.length > 0 ? { excludeTools: toolPlan.excludeTools } : {}),
 		extensionPaths,
+		requiredExtensions: toolPlan.requiredExtensions,
 		ambientExtensions,
 		hooks: capturedHooks.hooks,
 		...(input.host === "runner" ? { processEnv: childProcessEnv(input, toolPlan) } : {}),
