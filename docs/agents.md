@@ -216,10 +216,10 @@ You can override selected agent fields without copying the whole agent. Override
 }
 ```
 
-Supported override fields: `description`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritGlobalContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
+Supported override fields: `description`, `machine`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritGlobalContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
 
 - `description` replaces the discovered description for builtin and custom agents, which lets list output show deployment-specific routing or model metadata.
-- Use `output: false`, `defaultReads: false`, `defaultContext: false`, or `acceptanceRole: false` to clear an inherited value.
+- Use `output: false`, `defaultReads: false`, `defaultContext: false`, `acceptanceRole: false`, or `machine: false` to clear an inherited value.
 - Use `tools: "inherit"` when that one role should omit its bundled or frontmatter tool allowlist and receive Pi's normal builtins (plus ambient extensions when it runs as a background child).
 - Project overrides beat user overrides.
 - Matching package, user, and project agents also receive override fields, which replace the same fields declared in their frontmatter. This lets a shared agent keep its persona while local settings choose the effective model, context, tools, or other supported options.
@@ -233,6 +233,29 @@ Disable and restore:
 - `subagent({ action: "reset", agent: "reviewer" })` deletes the scope's custom agent file and/or settings override entry, restoring the bundled default. It refuses if no bundled default exists (use `delete` for purely custom agents).
 
 `eject`, `disable`, `enable`, and `reset` accept `agentScope: "user" | "project"` and operate in one scope at a time. Project overrides still win over user ones, so a project-scope disable survives a user-scope `enable` until you target the project scope.
+
+## Running external CLI agents on a Herdr saved machine
+
+The six code-owned external-cli profiles can run on a Herdr machine (`herdr machine add <target> --label <name>`). The local parent spawns `ssh -T <target>`, retaining prompt delivery, stream parsing, stop, and exit proof. Herdr's catalog is the host allowlist; raw ssh targets are rejected.
+
+`machine` is a top-level frontmatter key, a settings override (`subagents.agentOverrides.<agent>.machine`, project beats user, `false` clears a pin), and a launch option on the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps. The launch option wins. Placement survives `subagent({ action: "disable" })`, `reset`, and model profile switches.
+
+`cwd` means the directory on that machine when a machine is set. An absolute path or `~/...` is used as given; a relative path joins the repo's configured machine root; with no cwd the root is used; with no root the launch fails closed naming the setting:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": { "claude-code": { "machine": "workmac" } },
+    "machines": { "workmac": { "cwd": "/home/nico/proj", "env": { "CLAUDE_CONFIG_DIR": "/home/nico/.claude-work" } } }
+  }
+}
+```
+
+`machines.<label-or-id>.env` is optional and is exported in front of the remote command. Nothing else crosses: the local ssh process receives only `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, and `SSH_AUTH_SOCK`, and no local API key is copied. Remote runs use the machine's own credentials, so log in to the CLI on that machine once. Non-interactive ssh shells skip rc files, so `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin` are prepended to the remote `PATH`; for anything else set the agent's `command` to the absolute path on the machine.
+
+Remote `--version` and `--help` probes use a ready marker to discard rc-file noise. Runs share one OpenSSH ControlMaster socket per machine (`~/.pi/agent/ssh-control/`, `ControlPersist=60`). Status, receipts, and FleetView carry the machine identity, remote cwd, and remote git state; writer results state that changes are remote.
+
+pi-subagents never clones, pulls, or checks out on the machine; a missing directory fails the remote `cd` with a hint. Native Pi agents, generic `external-cli` commands, managed worktrees, and Windows hosts are rejected before launch. Codex's final message and Cursor's handoff file use the ssh stream and remote temp files, not local paths.
 
 ## Parent prompt discovery
 

@@ -9,6 +9,7 @@ import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from 
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
 import { openSubagentsAdmin } from "../../src/slash/subagents-admin.ts";
+import { writeNodeCommand } from "../support/node-command.ts";
 
 let tempDir = "";
 let oldAgentDir: string | undefined;
@@ -179,6 +180,45 @@ Missing.
 		} finally {
 			if (previousPath === undefined) delete process.env.PATH;
 			else process.env.PATH = previousPath;
+		}
+	});
+
+	it("does not preflight Herdr machines while listing capabilities", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "remote-external.md"), `---
+name: remote-external
+description: Remote external CLI
+machine: workmac
+runner:
+  type: external-cli
+  adapter: codex-exec
+  command: codex
+---
+Remote.
+`);
+		const binDir = path.join(tempDir, "bin");
+		fs.mkdirSync(binDir);
+		writeNodeCommand(binDir, "ssh", "process.exit(0)");
+		const previousPath = process.env.PATH;
+		const previousHerdrBin = process.env.HERDR_BIN;
+		try {
+			process.env.PATH = binDir;
+			process.env.HERDR_BIN = path.join(binDir, "missing-herdr");
+			const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, {
+				cwd: tempDir,
+				modelRegistry: { getAvailable: () => [] },
+			});
+			assert.equal(listed.isError, false);
+			assert.match(readText(listed), /external-cli:codex @ workmac ssh ✓; machine not preflighted/);
+			const runner = listed.details?.agentCapabilities?.agents.find((agent) => agent.name === "remote-external")?.runner;
+			assert.equal(runner?.type, "external-cli");
+			if (runner?.type === "external-cli") assert.equal(runner.available, true);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousHerdrBin === undefined) delete process.env.HERDR_BIN;
+			else process.env.HERDR_BIN = previousHerdrBin;
 		}
 	});
 

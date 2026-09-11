@@ -107,6 +107,7 @@ import { inspectSubagentStatus } from "../background/run-status.ts";
 import { getExternalJobProvider } from "../../api/external-job-provider.ts";
 import { externalJobFollowUpRequestDigest, externalJobFollowUpRequestId, externalJobFollowUpRunId, externalJobPromptDigest, externalJobStableJson } from "../shared/external-job-runner.ts";
 import { externalCliReceiptMetadata, normalizeExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
+import { formatHerdrMachineRunnerUnsupported } from "../shared/herdr-machine.ts";
 import { applyForceTopLevelAsyncOverride } from "../background/top-level-async.ts";
 import { handleMissionAction, MISSION_ACTIONS } from "../../missions/actions.ts";
 import { attachMissionToLaunchResult, prepareMissionLaunch, writeMissionAsyncBinding, type MissionLaunchBinding } from "../../missions/lifecycle.ts";
@@ -288,6 +289,7 @@ interface TaskParam {
 	agent: string;
 	task: string;
 	cwd?: string;
+	machine?: string;
 	count?: number;
 	output?: string | boolean;
 	outputMode?: "inline" | "file-only";
@@ -383,6 +385,9 @@ export interface SubagentParamsLike {
 	control?: ControlConfig;
 	sessionDir?: string;
 	cwd?: string;
+	machine?: string;
+	/** Internal: the typed cwd when a machine is set, kept as a remote path and never resolved locally. */
+	machineCwd?: string;
 	maxOutput?: MaxOutputConfig;
 	artifacts?: boolean;
 	includeProgress?: boolean;
@@ -2414,6 +2419,8 @@ function canonicalizeExecutionParams(params: SubagentParamsLike, agents: AgentCo
 		params = omitUndefinedProperties({ ...params, agent: result.name });
 		const agent = agents.find((candidate) => candidate.name === result.name);
 		if (params.extensionBindings !== undefined && (agent?.runner?.type === "external-cli" || agent?.runner?.type === "external-job")) return { error: `extensionBindings is not supported for runner.type='${agent.runner.type}'.` };
+		const machineError = agent ? formatHerdrMachineRunnerUnsupported({ machine: params.machine ?? agent.machine, agentName: agent.name, runnerType: agent.runner?.type, adapter: agent.runner?.type === "external-cli" ? agent.runner.adapter : undefined, worktree: params.worktree }) : undefined;
+		if (machineError) return { error: machineError };
 	}
 	if (params.extensionBindings !== undefined) {
 		try {
@@ -3292,6 +3299,8 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			availableModels,
 			cwd: effectiveCwd,
 			requestedCwd: data.requestedCwd,
+			machine: params.machine,
+			machineCwd: params.machineCwd,
 			maxOutput: params.maxOutput,
 			artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 			artifactConfig,
@@ -3455,6 +3464,23 @@ function appendWorkflowOutputWarning(text: string, warning: string | undefined):
 	return warning ? `${text}\n\n${warning}` : text;
 }
 
+export function resolveWorkflowChildLocalCwd(input: {
+	workflowCwd: string;
+	discoverAgents: (cwd: string, scope: AgentScope) => { agents: AgentConfig[] };
+	agents: AgentConfig[];
+	workflowAgentScope?: unknown;
+	params: Record<string, unknown>;
+}): string {
+	if (input.params.machine !== undefined) return input.workflowCwd;
+	if (typeof input.params.agent === "string") {
+		const agentScope = resolveExecutionAgentScope(input.params.agentScope ?? input.workflowAgentScope);
+		const workflowAgents = input.discoverAgents(input.workflowCwd, agentScope).agents;
+		const agent = resolveAgentName(input.params.agent, workflowAgents).agent ?? resolveAgentName(input.params.agent, input.agents).agent;
+		if (agent?.machine !== undefined) return input.workflowCwd;
+	}
+	return typeof input.params.cwd === "string" ? resolveChildCwd(input.workflowCwd, input.params.cwd) : input.workflowCwd;
+}
+
 function resolveWorkflowChildOutputPath(input: {
 	ctxCwd: string;
 	workflowCwd: string;
@@ -3480,7 +3506,7 @@ function resolveWorkflowChildOutputPath(input: {
 		}, input.state);
 		return { path: "recoveryDescriptor" in target ? target.recoveryDescriptor?.outputPath : undefined, inherited: false };
 	}
-	const childCwd = typeof input.params.cwd === "string" ? resolveChildCwd(input.workflowCwd, input.params.cwd) : input.workflowCwd;
+	const childCwd = resolveWorkflowChildLocalCwd(input);
 	let agentOutput: string | undefined;
 	if (rawOutput === true || rawOutput === "true" || (!hasExplicitOutput && !input.aggregateOutputPath)) {
 		const agentScope = resolveExecutionAgentScope(input.params.agentScope ?? input.workflowAgentScope);
@@ -3582,7 +3608,7 @@ function prepareWorkflowChildLaunchParams(input: {
 		const resolvedOutput = resolveWorkflowChildOutputPath({ ctxCwd: input.ctxCwd, workflowCwd: input.workflowCwd, artifactsDir: input.artifactsDir, workflowRunId: input.parentWorkflowRunId, aggregateOutputPath: input.aggregateOutputPath, configuredOutputBaseDir: input.configuredOutputBaseDir, discoverAgents: input.discoverAgents, agents: input.agents, workflowAgentScope: input.workflowAgentScope, key: input.workflowKey, params: input.childParams });
 		if (resolvedOutput.path) childParams = { ...input.childParams, output: resolvedOutput.path };
 	}
-	const childCwd = typeof childParams.cwd === "string" ? resolveChildCwd(input.workflowCwd, childParams.cwd) : input.workflowCwd;
+	const childCwd = resolveWorkflowChildLocalCwd({ ...input, params: childParams });
 	const agentScope = resolveExecutionAgentScope(childParams.agentScope ?? input.workflowAgentScope);
 	const discoveredAgents = input.discoverAgents(childCwd, agentScope).agents;
 	const agent = typeof childParams.agent === "string"
@@ -6026,9 +6052,24 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 		}
 		const directParams = requestParams;
-		const requestedCwd = directParams.cwd;
-		const requestCwd = resolveRequestedCwd(ctx.cwd, directParams.cwd);
-		const paramsWithResolvedCwd = directParams.cwd === undefined ? directParams : { ...directParams, cwd: requestCwd };
+		// With a machine, cwd names a directory on that machine: keep it out of every local path resolution.
+		// Placement can also come from the agent's frontmatter or settings override, so the agent is resolved first (discovery is fingerprint-cached).
+		const placedByAgent = (): boolean => {
+			if (directParams.machine !== undefined || directParams.cwd === undefined || typeof directParams.agent !== "string") return false;
+			try {
+				return resolveAgentName(directParams.agent, deps.discoverAgents(ctx.cwd, resolveExecutionAgentScope(directParams.agentScope)).agents).agent?.machine !== undefined;
+			} catch {
+				return false; // Discovery errors surface from the launch path itself.
+			}
+		};
+		const remotePlacement = directParams.action === undefined && (directParams.machine !== undefined || placedByAgent());
+		const requestedCwd = remotePlacement ? undefined : directParams.cwd;
+		const requestCwd = remotePlacement ? ctx.cwd : resolveRequestedCwd(ctx.cwd, directParams.cwd);
+		const paramsWithResolvedCwd = directParams.cwd === undefined
+			? directParams
+			: remotePlacement
+				? omitUndefinedProperties({ ...directParams, cwd: undefined, machineCwd: directParams.cwd })
+				: { ...directParams, cwd: requestCwd };
 		const action = paramsWithResolvedCwd.action;
 		let requestSessionId = "";
 		let requestPiSessionId: string | undefined;
